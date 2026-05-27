@@ -50,10 +50,16 @@ func init() {
 // cookies supplies the TFO cookie stamped on every outgoing SYN. T1.2 ships
 // a static stub (DefaultStaticCookie); T3.2 will swap it for a session-bound
 // HMAC provider at construction time.
+//
+// counters owns the drop-path counters bumped by the receive-side gate
+// installed in New (T1.3). One Counters per Transport, exposed via
+// Transport.Counters(); the eventual metrics framework (see Cross-Cutting
+// Concerns in docs/implementation-doc.md) will scrape these.
 type Transport struct {
-	cfg     *conf.Network
-	conn    *socket.PacketConn
-	cookies CookieProvider
+	cfg      *conf.Network
+	conn     *socket.PacketConn
+	cookies  CookieProvider
+	counters *Counters
 }
 
 // New is the Factory registered under Name. It opens the underlying pcap-based
@@ -76,9 +82,10 @@ func New(cfg transport.Config) (transport.Transport, error) {
 	}
 
 	t := &Transport{
-		cfg:     cfg.Network,
-		conn:    pConn,
-		cookies: NewStaticCookieProvider(DefaultStaticCookie()),
+		cfg:      cfg.Network,
+		conn:     pConn,
+		cookies:  NewStaticCookieProvider(DefaultStaticCookie()),
+		counters: NewCounters(),
 	}
 
 	// Install the T1.2 SYN-option builder: every emitted SYN carries the
@@ -94,7 +101,60 @@ func New(cfg transport.Config) (transport.Transport, error) {
 	// Install the T0.3-routed SYN seq-entropy fix.
 	pConn.SetSYNSeqDeriver(SYNSeq)
 
+	// Install the T1.3 receive-side TFO gate. Every parsed inbound packet
+	// runs through Transport.gateOptions: well-formed Kind=34 passes;
+	// missing or malformed TFO drops with the appropriate counter
+	// incremented. No per-packet logging — atomic counters are the entire
+	// diagnostic surface for the hot path (DoD).
+	pConn.SetSYNGate(t.gateOptions)
+
 	return t, nil
+}
+
+// gateOptions is the receive-side option-validation hook installed via
+// SetSYNGate. It returns true to accept a packet for the upper layer or
+// false to drop it; on drop it increments the appropriate counter.
+//
+// Cookie validation (the HMAC check against the session-bound provider) is
+// deferred to T3.2; T1.3 only enforces option *shape*. The decoded cookie
+// value is discarded here — see TODO below. Once T3.2 lands, gateOptions
+// will pass the cookie up to the session manager for HMAC validation; for
+// now it is decoded-but-unused so the hot-path call shape stays stable
+// across the T1.3 → T3.2 transition.
+//
+// Exposed as a method (rather than an anonymous closure inside New) so
+// tests can drive the gate directly without spinning up a pcap handle.
+// The method only touches Transport.counters; it is safe for concurrent
+// use because the counter implementation is built on atomic.Uint64.
+func (t *Transport) gateOptions(options []layers.TCPOption) bool {
+	_, status := classifyTFO(options)
+	switch status {
+	case tfoStatusOK:
+		// TODO(T3.2): pass the cookie value up to the session manager for
+		// the HMAC validation step. Today we discard it because no
+		// consumer exists.
+		return true
+	case tfoStatusMissing:
+		t.counters.incNoTFO()
+		return false
+	case tfoStatusMalformed:
+		t.counters.incMalformedTFO()
+		return false
+	default:
+		// Defensive — classifyTFO only returns the three statuses above.
+		// If a future refactor adds a new one, count it as a generic
+		// missing rather than panic on the hot path.
+		t.counters.incNoTFO()
+		return false
+	}
+}
+
+// Counters returns the SYN-TFO Transport's drop-path counters. The future
+// metrics framework (see Cross-Cutting Concerns in
+// docs/implementation-doc.md) will scrape these; today only tests read them.
+// The returned pointer is stable for the lifetime of the Transport.
+func (t *Transport) Counters() *Counters {
+	return t.counters
 }
 
 // PacketConn returns the underlying net.PacketConn. This is the seam KCP

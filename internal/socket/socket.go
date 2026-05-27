@@ -165,3 +165,10 @@ func (c *PacketConn) SetSYNOptionsBuilder(b SYNOptionsBuilder) {
 func (c *PacketConn) SetSYNSeqDeriver(d SYNSeqDeriver) {
 	c.sendHandle.SetSYNSeqDeriver(d)
 }
+
+// SetSYNGate forwards to the underlying RecvHandle. The SYN-TFO transport
+// calls this during its New() to install the receive-side option-validation
+// gate that rejects packets without a valid Kind=34 TFO option (T1.3).
+func (c *PacketConn) SetSYNGate(g SYNGate) {
+	c.recvHandle.SetSYNGate(g)
+}
