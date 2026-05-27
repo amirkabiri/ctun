@@ -1,328 +1,283 @@
+# ctun CI workflow.
+#
+# Owned by T4.5 (cross-platform CI matrix). See docs/implementation-doc.md.
+#
+# Triggers:
+#   - push to main and pull requests: run the build matrix + unit tests +
+#     Linux integration tests so every change is gated by the same checks
+#     a release would run.
+#   - tag push (v*.*.*) and manual dispatch: same checks, plus a release
+#     job that aggregates artifacts and publishes a GitHub release with
+#     SHA-256 checksums.
+#
+# Build matrix (DoD T4.5):
+#   - Linux   amd64  (ubuntu-latest, native)         - build + unit tests
+#   - Linux   arm64  (ubuntu-latest, cross via cgo)  - build only
+#   - macOS   amd64  (macos-latest is arm64; cross)  - build only
+#   - macOS   arm64  (macos-latest, native)          - build + unit tests
+#   - Windows amd64  (windows-latest, native)        - build + unit tests
+#
+# Cross-compiling Linux arm64 from an amd64 runner: we install the
+# aarch64 cross GCC and libpcap-dev:arm64 via dpkg --add-architecture
+# (mirrors build-selfhosted.yml). This is the lowest-friction path on
+# hosted ubuntu runners; a multiarch Docker container would also work
+# but adds an entire docker pull to the critical path.
+#
+# Integration tests (T0.2 / T1.5 / T3.5 verification) run on Linux only
+# in the test-integration-linux job below. The integration tests under
+# test/integration/ require root (raw sockets / pcap) and self-skip on
+# the unit-test matrix above when running as a non-root user.
+#
+# libpcap / Npcap install per OS:
+#   - Linux:    apt-get install -y libpcap-dev (host) +
+#               libpcap-dev:<arch> (cross targets via dpkg --add-architecture)
+#   - macOS:    libpcap ships with Xcode CLT; no extra install needed.
+#   - Windows:  choco install npcap -y. This is known-flaky; if the
+#               chocolatey package goes stale, switch to downloading
+#               npcap-sdk + the silent installer (/S) from nmap.org.
+#               TODO(maintainer): if choco breaks on a hosted runner,
+#               pre-install Npcap on a self-hosted runner instead.
+
 name: Build and Release
 
 on:
     workflow_dispatch:
     push:
+        branches:
+            - main
         tags:
             - "v*.*.*"
+    pull_request:
 
 permissions:
     contents: write
 
 jobs:
-    build-linux:
-        runs-on: ubuntu-latest
+    # Build matrix: covers all five (os, arch) targets from T4.5 DoD.
+    # Each matrix entry produces an upload-artifact upload; the release
+    # job consumes those on tag push.
+    build:
+        name: build ${{ matrix.goos }}/${{ matrix.goarch }}
+        runs-on: ${{ matrix.os }}
         strategy:
+            fail-fast: false
             matrix:
                 include:
-                    - goarch: amd64
+                    - os: ubuntu-latest
+                      goos: linux
+                      goarch: amd64
                       filename: amd64
-                      container: muslcc/x86_64:x86_64-linux-musl
-                    - goarch: arm64
+                      run_tests: true
+                    - os: ubuntu-latest
+                      goos: linux
+                      goarch: arm64
                       filename: arm64
-                      container: muslcc/x86_64:aarch64-linux-musl
-                    - goarch: arm
-                      filename: arm32
-                      container: muslcc/x86_64:arm-linux-musleabihf
-                    - goarch: mips
-                      filename: mips
-                      container: muslcc/x86_64:mips-linux-muslsf
-                    - goarch: mipsle
-                      filename: mipsle
-                      container: muslcc/x86_64:mipsel-linux-muslsf
-                    - goarch: mips64
-                      filename: mips64
-                      container: muslcc/x86_64:mips64-linux-musl
-                    - goarch: mips64le
-                      filename: mips64le
-                      container: muslcc/x86_64:mips64el-linux-musl
-
-        container:
-            image: ${{ matrix.container }}
+                      # Cross-compile from amd64 runner; arm64 unit tests
+                      # need an emulator (qemu) which is out of scope here.
+                      run_tests: false
+                    - os: macos-latest
+                      goos: darwin
+                      goarch: amd64
+                      filename: amd64
+                      # macos-latest is arm64; amd64 is a cross-compile.
+                      run_tests: false
+                    - os: macos-latest
+                      goos: darwin
+                      goarch: arm64
+                      filename: arm64
+                      run_tests: true
+                    - os: windows-latest
+                      goos: windows
+                      goarch: amd64
+                      filename: amd64
+                      run_tests: true
 
         steps:
-            - name: Install Build Dependencies
-              run: |
-                  apk update
-                  apk add --no-cache git bash tar gzip wget flex bison linux-headers make
+            - name: Checkout
+              uses: actions/checkout@v4
 
-            - name: Install Go
-              run: |
-                  GO_VERSION=1.26.0
-                  GO_ARCH=amd64
-                  
-                  wget -q https://go.dev/dl/go${GO_VERSION}.linux-${GO_ARCH}.tar.gz
-                  tar -C /usr/local -xzf go${GO_VERSION}.linux-${GO_ARCH}.tar.gz
-                  rm go${GO_VERSION}.linux-${GO_ARCH}.tar.gz
-                  
-                  # Add Go to PATH
-                  echo "/usr/local/go/bin" >> $GITHUB_PATH
-                  export PATH=$PATH:/usr/local/go/bin
+            - name: Setup Go
+              uses: actions/setup-go@v5
+              with:
+                  go-version: "1.25"
 
-            - name: Checkout Code
+            # libpcap / Npcap install. See header comment for rationale.
+            - name: Install libpcap (Linux host)
+              if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
               run: |
-                  git config --global --add safe.directory $GITHUB_WORKSPACE
-                  git clone --depth 1 --branch ${GITHUB_REF#refs/heads/} https://github.com/${{ github.repository }} . 2>/dev/null || \
-                  git clone --depth 1 --branch ${GITHUB_REF#refs/tags/} https://github.com/${{ github.repository }} . 2>/dev/null || \
-                  git clone https://github.com/${{ github.repository }} .
-                  git checkout ${{ github.sha }}
+                  sudo apt-get update
+                  sudo apt-get install -y --no-install-recommends libpcap-dev
 
-            - name: Build Static libpcap
+            - name: Install libpcap (Linux arm64 cross)
+              if: matrix.goos == 'linux' && matrix.goarch == 'arm64'
+              run: |
+                  sudo dpkg --add-architecture arm64
+                  # Restrict the default sources.list to amd64 so apt does
+                  # not try to fetch arm64 packages from x86_64 mirrors.
+                  sudo sed -i 's/^deb /deb [arch=amd64] /' /etc/apt/sources.list || true
+                  # Add an arm64 source for ports.ubuntu.com.
+                  sudo tee /etc/apt/sources.list.d/arm64.list <<'EOF'
+                  deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ jammy main universe
+                  deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ jammy-updates main universe
+                  EOF
+                  sudo apt-get update
+                  sudo apt-get install -y --no-install-recommends \
+                      gcc-aarch64-linux-gnu libc6-dev-arm64-cross libpcap-dev:arm64
+
+            # macOS libpcap ships with Xcode CLT; nothing to install.
+
+            - name: Install Npcap (Windows)
+              if: matrix.goos == 'windows'
+              # Known pain point: Npcap requires a GUI installer or a silent
+              # switch. choco wraps the silent install. If choco proves
+              # unreliable on the hosted runner, replace with a direct
+              # download from nmap.org and `npcap-installer.exe /S`.
+              run: |
+                  choco install npcap -y --no-progress
+                  choco install mingw -y --no-progress
+
+            - name: Resolve version stamp
+              id: ref_id
+              shell: bash
+              run: |
+                  if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+                      REF_ID="${GITHUB_REF#refs/tags/}"
+                  else
+                      REF_ID=$(git rev-parse --short HEAD)
+                  fi
+                  echo "ref=$REF_ID" >> $GITHUB_OUTPUT
+
+            - name: Build
+              shell: bash
+              env:
+                  CGO_ENABLED: "1"
+                  GOOS: ${{ matrix.goos }}
+                  GOARCH: ${{ matrix.goarch }}
               run: |
                   set -e
-                  
-                  # Download libpcap
-                  LIBPCAP_VERSION=1.10.6
-                  wget -q https://www.tcpdump.org/release/libpcap-${LIBPCAP_VERSION}.tar.gz
-                  tar -xzf libpcap-${LIBPCAP_VERSION}.tar.gz
-                  cd libpcap-${LIBPCAP_VERSION}
-                  
-                  CC=gcc
-                  if [ "${{ matrix.goarch }}" = "amd64" ]; then
-                    HOST_FLAG=""
-                  elif [ "${{ matrix.goarch }}" = "arm64" ]; then
-                    HOST_FLAG="--host=aarch64-linux-musl"
-                  elif [ "${{ matrix.goarch }}" = "arm" ]; then
-                    HOST_FLAG="--host=arm-linux-musleabihf"
-                  elif [ "${{ matrix.goarch }}" = "mips" ]; then
-                    HOST_FLAG="--host=mips-linux-muslsf"
-                  elif [ "${{ matrix.goarch }}" = "mipsle" ]; then
-                    HOST_FLAG="--host=mipsel-linux-muslsf"
-                  elif [ "${{ matrix.goarch }}" = "mips64" ]; then
-                    HOST_FLAG="--host=mips64-linux-musl"
-                  elif [ "${{ matrix.goarch }}" = "mips64le" ]; then
-                    HOST_FLAG="--host=mips64el-linux-musl"
-                  fi
-                  
-                  # Configure and build libpcap
-                  ./configure ${HOST_FLAG} \
-                    --prefix=/opt/libpcap \
-                    --disable-shared \
-                    --disable-dbus \
-                    --disable-bluetooth \
-                    --disable-usb \
-                    --with-pcap=linux
-                  
-                  make -j$(nproc)
-                  make install
-                  
-                  cd ..
-
-            - name: Get tag or commit
-              id: ref_id
-              shell: bash
-              run: |
-                  if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-                    REF_ID="${GITHUB_REF#refs/tags/}"
-                    echo "Triggered by tag: $REF_ID"
-                  else
-                    REF_ID=$(git rev-parse --short HEAD)
-                    echo "No tag detected. Using commit hash: $REF_ID"
-                  fi
-                  echo "ref=$REF_ID" >> $GITHUB_OUTPUT
-
-            - name: Build
-              run: |
                   mkdir -p dist
 
-                  export CGO_ENABLED=1 
-                  export GOOS=linux 
-                  export GOARCH=${{ matrix.goarch }}
-                  export CC=gcc
-                  export VERSION=${{ steps.ref_id.outputs.ref }}
-                  export GIT_COMMIT=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
-                  export GIT_TAG=$(git describe --tags --exact-match 2>/dev/null || echo "unknown")
-                  export BUILD_TIME=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
-                  
-                  # Set PKG_CONFIG_PATH for libpcap
-                  export PKG_CONFIG_PATH=/opt/libpcap/lib/pkgconfig
-                  export CGO_CFLAGS="-I/opt/libpcap/include"
-                  export CGO_LDFLAGS="-L/opt/libpcap/lib -lpcap"
+                  VERSION=${{ steps.ref_id.outputs.ref }}
+                  GIT_COMMIT=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
+                  GIT_TAG=$(git describe --tags --exact-match 2>/dev/null || echo "unknown")
+                  BUILD_TIME=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
 
-                  # Set GOARM for arm32
-                  if [ "$GOARCH" = "arm" ]; then
-                    export GOARM=7
-                  fi
-                  
-                  if [ "$GOARCH" = "mips" ] || [ "$GOARCH" = "mipsle" ]; then
-                    export GOMIPS=softfloat
-                  fi
-                  if [ "$GOARCH" = "mips64" ] || [ "$GOARCH" = "mips64le" ]; then
-                    export GOMIPS64=hardfloat
+                  # Cross-compile toolchain selection.
+                  if [ "$GOOS" = "linux" ] && [ "$GOARCH" = "arm64" ]; then
+                      export CC=aarch64-linux-gnu-gcc
                   fi
 
-                  if [ "$GOARCH" = "mips" ] || [ "$GOARCH" = "mipsle" ] || [ "$GOARCH" = "mips64" ] || [ "$GOARCH" = "mips64le" ]; then
-                    GCFLAGS=""
+                  if [ "$GOOS" = "windows" ]; then
+                      OUT="ctun_${GOOS}_${GOARCH}.exe"
                   else
-                    GCFLAGS="all=-l=4"
+                      OUT="ctun_${GOOS}_${GOARCH}"
                   fi
 
-                  go build -v -a -trimpath \
-                    -gcflags "${GCFLAGS}" \
-                    -ldflags "-s -w -buildid= -linkmode external -extldflags '-static' \
-                    -X 'ctun/cmd/version.Version=${VERSION}' \
-                    -X 'ctun/cmd/version.GitCommit=${GIT_COMMIT}' \
-                    -X 'ctun/cmd/version.GitTag=${GIT_TAG}' \
-                    -X 'ctun/cmd/version.BuildTime=${BUILD_TIME}'" \
-                    -o ctun_linux_${{ matrix.filename }} ./
+                  go build -v -trimpath \
+                      -ldflags "-s -w -buildid= \
+                          -X 'ctun/cmd/version.Version=${VERSION}' \
+                          -X 'ctun/cmd/version.GitCommit=${GIT_COMMIT}' \
+                          -X 'ctun/cmd/version.GitTag=${GIT_TAG}' \
+                          -X 'ctun/cmd/version.BuildTime=${BUILD_TIME}'" \
+                      -o "${OUT}" ./
 
-                  chmod +x ctun_linux_${{ matrix.filename }}
-                  tar -czvf dist/ctun-linux-${{ matrix.filename }}-${{ steps.ref_id.outputs.ref }}.tar.gz \
-                    ctun_linux_${{ matrix.filename }} \
-                    README.md \
-                    example/client.yaml.example \
-                    example/server.yaml.example
+                  # Package per-OS. Linux/macOS use tar.gz, Windows zip.
+                  if [ "$GOOS" = "windows" ]; then
+                      7z a -tzip "dist/ctun-${GOOS}-${{ matrix.filename }}-${VERSION}.zip" \
+                          "${OUT}" README.md \
+                          example/client.yaml.example example/server.yaml.example
+                  else
+                      chmod +x "${OUT}"
+                      tar -czvf "dist/ctun-${GOOS}-${{ matrix.filename }}-${VERSION}.tar.gz" \
+                          "${OUT}" README.md \
+                          example/client.yaml.example example/server.yaml.example
+                  fi
 
-            - name: Upload Artifact
+            # Unit tests run on the three native targets (Linux amd64,
+            # macOS arm64, Windows amd64). The integration tests under
+            # test/integration/ self-skip when not root, so `go test ./...`
+            # is safe here. The canonical integration job is below.
+            - name: Unit tests
+              if: matrix.run_tests
+              shell: bash
+              env:
+                  CGO_ENABLED: "1"
+              run: go test -count=1 -race ./...
+
+            - name: Upload artifact
               uses: actions/upload-artifact@v4
               with:
-                  name: ctun-linux-${{ matrix.filename }}
-                  path: dist/ctun-linux-${{ matrix.filename }}-${{ steps.ref_id.outputs.ref }}.tar.gz
+                  name: ctun-${{ matrix.goos }}-${{ matrix.filename }}
+                  path: dist/*
                   retention-days: 7
 
-    build-windows:
-        runs-on: windows-latest
-        strategy:
-            matrix:
-                goarch: [amd64]
-        steps:
-            - name: Setup Build Environment
-              run: |
-                  # Install Npcap for libpcap support on Windows
-                  choco install npcap -y
-                  # Install MinGW for CGO support
-                  choco install mingw -y
-
-            - name: Checkout Code
-              uses: actions/checkout@v6
-
-            - name: Setup Go
-              uses: actions/setup-go@v6
-              with:
-                  go-version: "1.26"
-
-            - name: Get tag or commit
-              id: ref_id
-              shell: bash
-              run: |
-                  if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-                    REF_ID="${GITHUB_REF#refs/tags/}"
-                    echo "Triggered by tag: $REF_ID"
-                  else
-                    REF_ID=$(git rev-parse --short HEAD)
-                    echo "No tag detected. Using commit hash: $REF_ID"
-                  fi
-                  echo "ref=$REF_ID" >> $GITHUB_OUTPUT
-
-            - name: Build
-              shell: bash
-              run: |
-                  mkdir -p dist
-                  export CGO_ENABLED=1 
-                  export GOOS=windows 
-                  export GOARCH=${{ matrix.goarch }}
-                  export VERSION=${{ steps.ref_id.outputs.ref }}
-                  export GIT_COMMIT=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
-                  export GIT_TAG=$(git describe --tags --exact-match 2>/dev/null || echo "unknown")
-                  export BUILD_TIME=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
-
-                  go build -v -a -trimpath \
-                    -gcflags "all=-l=4" \
-                    -ldflags "-s -w -buildid= \
-                    -X 'ctun/cmd/version.Version=${VERSION}' \
-                    -X 'ctun/cmd/version.GitCommit=${GIT_COMMIT}' \
-                    -X 'ctun/cmd/version.GitTag=${GIT_TAG}' \
-                    -X 'ctun/cmd/version.BuildTime=${BUILD_TIME}'" \
-                    -o ctun_windows_${{ matrix.goarch }}.exe ./
-
-                  7z a -tzip dist/ctun-windows-${{ matrix.goarch }}-${{ steps.ref_id.outputs.ref }}.zip \
-                    ctun_windows_${{ matrix.goarch }}.exe \
-                    README.md \
-                    example/client.yaml.example \
-                    example/server.yaml.example
-
-            - name: Upload Artifact
-              uses: actions/upload-artifact@v6
-              with:
-                  name: ctun-windows-${{ matrix.goarch }}
-                  path: dist/ctun-windows-${{ matrix.goarch }}-${{ steps.ref_id.outputs.ref }}.zip
-                  retention-days: 7
-
-    build-darwin:
-        runs-on: macos-latest
-        strategy:
-            matrix:
-                goarch: [amd64, arm64]
-        steps:
-            - name: Checkout Code
-              uses: actions/checkout@v6
-
-            - name: Setup Go
-              uses: actions/setup-go@v6
-              with:
-                  go-version: "1.26"
-
-            - name: Get tag or commit
-              id: ref_id
-              run: |
-                  if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-                    REF_ID="${GITHUB_REF#refs/tags/}"
-                    echo "Triggered by tag: $REF_ID"
-                  else
-                    REF_ID=$(git rev-parse --short HEAD)
-                    echo "No tag detected. Using commit hash: $REF_ID"
-                  fi
-                  echo "ref=$REF_ID" >> $GITHUB_OUTPUT
-
-            - name: Build
-              run: |
-                  mkdir -p dist
-                  export CGO_ENABLED=1 
-                  export GOOS=darwin 
-                  export GOARCH=${{ matrix.goarch }}
-                  export VERSION=${{ steps.ref_id.outputs.ref }}
-                  export GIT_COMMIT=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
-                  export GIT_TAG=$(git describe --tags --exact-match 2>/dev/null || echo "unknown")
-                  export BUILD_TIME=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
-
-                  go build -v -a -trimpath \
-                    -gcflags "all=-l=4" \
-                    -ldflags "-s -w -buildid= \
-                    -X 'ctun/cmd/version.Version=${VERSION}' \
-                    -X 'ctun/cmd/version.GitCommit=${GIT_COMMIT}' \
-                    -X 'ctun/cmd/version.GitTag=${GIT_TAG}' \
-                    -X 'ctun/cmd/version.BuildTime=${BUILD_TIME}'" \
-                    -o ctun_darwin_${{ matrix.goarch }} ./
-
-                  chmod +x ctun_darwin_${{ matrix.goarch }}
-                  tar -czvf dist/ctun-darwin-${{ matrix.goarch }}-${{ steps.ref_id.outputs.ref }}.tar.gz \
-                    ctun_darwin_${{ matrix.goarch }} \
-                    README.md \
-                    example/client.yaml.example \
-                    example/server.yaml.example
-
-            - name: Upload Artifact
-              uses: actions/upload-artifact@v6
-              with:
-                  name: ctun-darwin-${{ matrix.goarch }}
-                  path: dist/ctun-darwin-${{ matrix.goarch }}-${{ steps.ref_id.outputs.ref }}.tar.gz
-                  retention-days: 7
-
-    release:
+    # Canonical integration job. Satisfies the DoD verification items in
+    # T0.2 (Smoke_PaqetBaseline — currently quarantined), T1.5
+    # (Smoke_SynTfo), T3.5 (SecureTunnel), and T4.1's Linux-firewall
+    # integration test. Runs on Linux only because:
+    #   - macOS loopback uses DLT_NULL link-layer, which the current
+    #     SYN-TFO transport does not handle (tracked in T1.1 follow-ups);
+    #   - Windows admin elevation in hosted Actions runners is awkward
+    #     and the firewall/integration story on Windows is covered by
+    #     unit tests in the build matrix above.
+    test-integration-linux:
+        name: integration tests (Linux, root)
         runs-on: ubuntu-latest
-        needs: [build-linux, build-darwin, build-windows]
-        if: startsWith(github.ref, 'refs/tags/')
+        # Always run on push/PR; on tag push too. This job gates release.
+        needs: []
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v4
+
+            - name: Setup Go
+              uses: actions/setup-go@v5
+              with:
+                  go-version: "1.25"
+
+            - name: Install libpcap and iptables
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y --no-install-recommends \
+                      libpcap-dev iptables
+
+            # Build the test binary as a non-root user (cache friendly),
+            # then run it under sudo so raw sockets / pcap work. The
+            # `-count=1` disables Go's test cache.
+            - name: Run integration tests
+              env:
+                  CGO_ENABLED: "1"
+              run: |
+                  # `sudo -E go test ...` preserves $PATH and module cache;
+                  # required so sudo'd Go can find its toolchain.
+                  sudo -E env "PATH=$PATH" go test -count=1 -v ./test/integration/
+
+    # Release job: tag-only. Pulls every build matrix artifact, generates
+    # a SHA256SUMS file alongside, and publishes a GitHub release.
+    # Checksum generation happens on a single Linux job because
+    # sha256sum is uniformly available there.
+    release:
+        name: release
+        runs-on: ubuntu-latest
+        needs: [build, test-integration-linux]
+        if: startsWith(github.ref, 'refs/tags/v')
         steps:
             - name: Download all build artifacts
-              uses: actions/download-artifact@v7
+              uses: actions/download-artifact@v4
               with:
                   path: ./dist
                   pattern: ctun-*
                   merge-multiple: true
 
-            - name: Create Release
+            - name: Generate SHA-256 checksums
+              run: |
+                  cd dist
+                  sha256sum * > SHA256SUMS
+                  cat SHA256SUMS
+
+            - name: Create GitHub release
               uses: softprops/action-gh-release@v2
               with:
                   files: dist/*
+                  generate_release_notes: true
               env:
                   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
