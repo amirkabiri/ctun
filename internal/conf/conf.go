@@ -29,7 +29,13 @@ type Conf struct {
 	// beyond the validator accepting it. See internal/conf/cipher.go
 	// for the rationale (this field is distinct from `transport.kcp.block`
 	// which routes to kcp-go's per-segment BlockCrypt layer).
-	Cipher    string    `yaml:"cipher"`
+	Cipher string `yaml:"cipher"`
+	// Firewall configures ctun's automatic host-firewall rule management.
+	// Default is auto-install on startup / clean-up on shutdown. See
+	// internal/conf/firewall.go for the field semantics. T4.1 introduces
+	// the schema and the Linux backend; T4.4 wires the runtime selection
+	// into the run command.
+	Firewall  Firewall  `yaml:"firewall"`
 	Listen    Server    `yaml:"listen"`
 	SOCKS5    []SOCKS5  `yaml:"socks5"`
 	Forward   []Forward `yaml:"forward"`
@@ -75,6 +81,7 @@ func (c *Conf) setDefaults() {
 	c.Network.setDefaults(c.Role)
 	c.Server.setDefaults()
 	c.Transport.setDefaults(c.Role)
+	c.Firewall.setDefaults()
 	if c.TransportImpl == "" {
 		// "syn-tfo" matches syntfo.Name and is registered via the syntfo
 		// package's init(); we deliberately use a string literal here to
@@ -123,6 +130,7 @@ func (c *Conf) validate() error {
 
 	allErrors = append(allErrors, c.Network.validate()...)
 	allErrors = append(allErrors, c.Transport.validate()...)
+	allErrors = append(allErrors, c.Firewall.validate()...)
 	if c.Role == "server" {
 		allErrors = append(allErrors, c.Listen.validate()...)
 	} else {
