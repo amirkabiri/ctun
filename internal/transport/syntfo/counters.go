@@ -81,6 +81,31 @@ type Counters struct {
 	// because the gate is the first place we can detect it on the
 	// receive path.
 	droppedMalformedFrame atomic.Uint64
+
+	// droppedAEADOpenFail is incremented by secureConn.ReadFrom when an
+	// inbound payload's AEAD Open returns ErrAuthFailed (or any other
+	// crypto-level rejection). The single most likely cause is a tampered
+	// packet on the wire; secondary causes include a key-mismatch between
+	// client and server (PSK drift) and a packet whose cookie validated
+	// but whose AEAD ciphertext does not (a buggy attacker that managed to
+	// forge a valid cookie but not the AEAD tag). Maps to the design-doc /
+	// Cross-Cutting Concerns counter named "dropped_aead_open_fail".
+	droppedAEADOpenFail atomic.Uint64
+
+	// droppedUnknownSession is incremented by secureConn.ReadFrom when the
+	// inner protocol frame's SessionID does not map to any registered
+	// session. After a successful AEAD Open the SessionID is trusted (the
+	// AEAD tag covers the header), so an unknown session here means
+	// (a) the session was garbage-collected between Open and lookup, or
+	// (b) the sender used a SessionID that was never minted in our table.
+	// Either way the right action is silent drop + counter.
+	droppedUnknownSession atomic.Uint64
+
+	// droppedReplay is incremented by secureConn.ReadFrom when the inner
+	// frame's Sequence fails the session's ReplayFilter.Check — duplicate
+	// or out-of-window. Maps to the design-doc / Cross-Cutting Concerns
+	// counter named "dropped_replay".
+	droppedReplay atomic.Uint64
 }
 
 // NewCounters returns a Counters initialised to zero. Tests construct one
@@ -154,4 +179,43 @@ func (c *Counters) incNonHelloZeroCookie() {
 // Package-private.
 func (c *Counters) incMalformedFrame() {
 	c.droppedMalformedFrame.Add(1)
+}
+
+// DroppedAEADOpenFail returns the current value of the
+// dropped_aead_open_fail counter. T3.4 ticks this when secureConn.ReadFrom
+// observes an AEAD Open failure (tag mismatch / wrong key / tampered
+// ciphertext).
+func (c *Counters) DroppedAEADOpenFail() uint64 {
+	return c.droppedAEADOpenFail.Load()
+}
+
+// DroppedUnknownSession returns the current value of the
+// dropped_unknown_session counter. T3.4 ticks this when secureConn.ReadFrom
+// successfully opens a frame but its SessionID is not registered.
+func (c *Counters) DroppedUnknownSession() uint64 {
+	return c.droppedUnknownSession.Load()
+}
+
+// DroppedReplay returns the current value of the dropped_replay counter.
+// T3.4 ticks this when an opened frame's Sequence fails the per-session
+// anti-replay window check.
+func (c *Counters) DroppedReplay() uint64 {
+	return c.droppedReplay.Load()
+}
+
+// incAEADOpenFail increments the dropped_aead_open_fail counter.
+// Package-private.
+func (c *Counters) incAEADOpenFail() {
+	c.droppedAEADOpenFail.Add(1)
+}
+
+// incUnknownSession increments the dropped_unknown_session counter.
+// Package-private.
+func (c *Counters) incUnknownSession() {
+	c.droppedUnknownSession.Add(1)
+}
+
+// incReplay increments the dropped_replay counter. Package-private.
+func (c *Counters) incReplay() {
+	c.droppedReplay.Add(1)
 }

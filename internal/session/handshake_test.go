@@ -430,7 +430,7 @@ func (s *recordingServerSender) last() HelloAck {
 }
 
 func TestServerHandshake_AcceptsValidHello_EmitsHelloAck_MintsSession(t *testing.T) {
-	mgr := NewManager(keyA)
+	mgr := NewManager(keyA, keyA)
 	sender := &recordingServerSender{}
 	hello := BuildHello(keyA, fixedNow)
 
@@ -465,7 +465,7 @@ func TestServerHandshake_AcceptsValidHello_EmitsHelloAck_MintsSession(t *testing
 }
 
 func TestServerHandshake_RejectsBadHMAC_EmitsZeroPackets_IncrementsCounter(t *testing.T) {
-	mgr := NewManager(keyA)
+	mgr := NewManager(keyA, keyA)
 	sender := &recordingServerSender{}
 	// Build HELLO under keyB so the HMAC fails under the server's keyA.
 	hello := BuildHello(keyB, fixedNow)
@@ -489,7 +489,7 @@ func TestServerHandshake_RejectsBadHMAC_EmitsZeroPackets_IncrementsCounter(t *te
 }
 
 func TestServerHandshake_RejectsStaleHello_EmitsZeroPackets_IncrementsCounter(t *testing.T) {
-	mgr := NewManager(keyA)
+	mgr := NewManager(keyA, keyA)
 	sender := &recordingServerSender{}
 	// Build HELLO with a timestamp 5 minutes in the past — well outside
 	// the default ±60s skew.

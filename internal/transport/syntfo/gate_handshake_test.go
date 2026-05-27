@@ -43,11 +43,22 @@ var gateAuthKey = func() [32]byte {
 	return k
 }()
 
+// gateEncKey is the paired AEAD key for gate-level tests (T3.4 widened
+// NewManager to take encKey as its first argument). Distinct bytes from
+// gateAuthKey so a regression that confused the two surfaces immediately.
+var gateEncKey = func() [32]byte {
+	var k [32]byte
+	for i := range k {
+		k[i] = 0x5A
+	}
+	return k
+}()
+
 // newGateTransport builds a syntfo.Transport stub wired with a session
 // manager backed by gateAuthKey. The pcap handle is left nil because none
 // of these tests reach the wire; only gateOptions is invoked.
 func newGateTransport() *Transport {
-	mgr := session.NewManager(gateAuthKey)
+	mgr := session.NewManager(gateEncKey, gateAuthKey)
 	return &Transport{
 		counters: NewCounters(),
 		mgr:      mgr,
@@ -228,39 +239,68 @@ func TestGate_RejectsDataWithWrongCookie(t *testing.T) {
 	}
 }
 
-// TestGate_RejectsMalformedFrame guards the inner-Unmarshal branch added
-// in T3.3: TFO is well-formed, cookie is non-zero, but the protocol
-// payload fails Unmarshal. The gate drops the packet and ticks the
-// dedicated DroppedMalformedFrame counter.
+// TestGate_RejectsMalformedFrame_NonZeroCookie_UnknownSession locks in the
+// T3.4 reshape of the non-zero-cookie gate branch: with AEAD-wrapped data
+// frames the gate no longer Unmarshals the inner payload (the bytes are
+// AEAD ciphertext, not plaintext protocol frames). Instead, the gate
+// performs a fast pre-decrypt reject by looking the session up by cookie
+// via mgr.LookupByCookie. A bogus / unregistered cookie therefore drops
+// with the DroppedBadCookieValidator counter, regardless of payload
+// contents. Post-decrypt frame-shape validation lives in secureConn.
 //
-// This isn't in the T3.3 brief's locked-in tests but it falls out of the
-// gate's decision tree — keeping it tested means a future refactor that
-// accidentally accepts garbage payloads will fail this test rather than
-// quietly poison the upper-layer dispatcher.
-func TestGate_RejectsMalformedFrame(t *testing.T) {
+// This replaces T3.3's TestGate_RejectsMalformedFrame, which asserted the
+// old behaviour (Unmarshal in the gate, DroppedMalformedFrame on shape
+// failure). The new behaviour drops earlier and via a different counter.
+func TestGate_RejectsMalformedFrame_NonZeroCookie_UnknownSession(t *testing.T) {
 	tr := newGateTransport()
 
-	// 5 bytes — well short of HeaderSize = 15. protocol.Unmarshal returns
-	// ErrTruncated; the gate maps that to incMalformedFrame.
+	// 5 bytes of garbage payload + an unregistered cookie. The gate must
+	// reject on cookie lookup, never reach payload parsing.
 	bogus := []byte{0x00, 0x01, 0x02, 0x03, 0x04}
 	someCookie := [CookieSize]byte{0xFF, 0xFE, 0xFD, 0xFC, 0xFB, 0xFA, 0xF9, 0xF8}
 
 	if got := tr.gateOptions(optsWithCookie(someCookie), bogus); got {
-		t.Fatalf("gateOptions(malformed-frame): got accept, want drop")
+		t.Fatalf("gateOptions(unregistered-cookie): got accept, want drop")
 	}
-	if got := tr.counters.DroppedMalformedFrame(); got != 1 {
-		t.Errorf("DroppedMalformedFrame = %d, want 1", got)
+	if got := tr.counters.DroppedBadCookieValidator(); got != 1 {
+		t.Errorf("DroppedBadCookieValidator = %d, want 1", got)
+	}
+	// The payload was never Unmarshalled, so the malformed-frame counter
+	// stays at zero — that counter is now secureConn's concern.
+	if got := tr.counters.DroppedMalformedFrame(); got != 0 {
+		t.Errorf("DroppedMalformedFrame = %d, want 0 (gate no longer parses non-zero-cookie payloads)", got)
 	}
 }
 
-// TestGate_EmptyPayload_Drops covers the explicit empty-payload branch.
-// A TFO-OK packet with zero application bytes can't carry a protocol
-// frame; treat as malformed.
-func TestGate_EmptyPayload_Drops(t *testing.T) {
+// TestGate_EmptyPayload_NonZeroCookie_UnknownSession covers the empty-payload
+// branch under the same T3.4 reshape: empty payload + unregistered cookie
+// drops on the cookie lookup, regardless of payload length. The previous
+// "empty payload → malformed-frame" assertion no longer applies because the
+// gate does not parse the payload on the non-zero-cookie path.
+func TestGate_EmptyPayload_NonZeroCookie_UnknownSession(t *testing.T) {
 	tr := newGateTransport()
 	someCookie := [CookieSize]byte{0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22}
 	if got := tr.gateOptions(optsWithCookie(someCookie), nil); got {
-		t.Fatalf("gateOptions(empty payload): got accept, want drop")
+		t.Fatalf("gateOptions(empty payload, unregistered cookie): got accept, want drop")
+	}
+	if got := tr.counters.DroppedBadCookieValidator(); got != 1 {
+		t.Errorf("DroppedBadCookieValidator = %d, want 1", got)
+	}
+	if got := tr.counters.DroppedMalformedFrame(); got != 0 {
+		t.Errorf("DroppedMalformedFrame = %d, want 0 (gate no longer parses non-zero-cookie payloads)", got)
+	}
+}
+
+// TestGate_EmptyPayload_ZeroCookie_DropsAsMalformed locks in the remaining
+// malformed-frame branch the gate still owns: zero-cookie packets must
+// carry a plaintext HELLO payload. An empty payload on the zero-cookie
+// HELLO path is still parsed by the gate (the HELLO frame is plaintext) and
+// fails Unmarshal, ticking DroppedMalformedFrame.
+func TestGate_EmptyPayload_ZeroCookie_DropsAsMalformed(t *testing.T) {
+	tr := newGateTransport()
+	zero := [CookieSize]byte{}
+	if got := tr.gateOptions(optsWithCookie(zero), nil); got {
+		t.Fatalf("gateOptions(empty payload, zero cookie): got accept, want drop")
 	}
 	if got := tr.counters.DroppedMalformedFrame(); got != 1 {
 		t.Errorf("DroppedMalformedFrame = %d, want 1", got)

@@ -101,6 +101,12 @@ type Counters struct {
 // session-bound TFO cookies. One Manager is constructed per ctun process
 // (server or client) by the cmd/run wiring.
 //
+// T3.4 extends the constructor to also accept encKey — the ChaCha20-Poly1305
+// key used by the data-path AEAD wrapper. Both keys come from
+// crypto.DeriveKeys(psk); the manager stores them so the syntfo transport's
+// secureConn can fetch encKey via EncKey() without re-deriving and so future
+// session-scoped key-rotation work has a single ownership site.
+//
 // TODO(session-lifetime): design-doc §8.4 mentions session expiry as part of
 // the security model; T3.2 keeps the table unbounded because no exchange is
 // wired yet to populate it. Once T3.3 lands and real sessions accumulate,
@@ -108,25 +114,48 @@ type Counters struct {
 // Until then the manager has no background goroutines (the goleak check in
 // manager_test.go enforces this).
 type Manager struct {
+	encKey   [32]byte
 	authKey  [32]byte
 	mu       sync.RWMutex
 	sessions map[SessionID]*Session
+	// byCookie indexes registered sessions by their cached cookie. T3.4 uses
+	// this for the gate's pre-decrypt cookie validation: with AEAD-wrapped
+	// payloads the SessionID is no longer visible in plaintext, so the gate
+	// can no longer fetch a session by SessionID. Looking up by the cookie
+	// (which is HMAC-SHA256(authKey, sessionID)[:8] and therefore unique per
+	// session with overwhelming probability) keeps the "fast pre-decrypt
+	// reject" property the design-doc §8.4 calls for.
+	byCookie map[[CookieSize]byte]*Session
 	counters Counters
 }
 
 // NewManager constructs a Manager that derives session cookies from the
-// supplied authKey via HMAC-SHA256(authKey, sessionID)[:CookieSize]. The
-// authKey is typically the second of the two 32-byte subkeys returned by
-// crypto.DeriveKeys (the first being the AEAD encryption key); see design
-// §8.1 for the derivation contract.
+// supplied authKey via HMAC-SHA256(authKey, sessionID)[:CookieSize] and that
+// hands encKey to its Sessions for the data-path AEAD wrapper (T3.4).
+//
+// encKey and authKey are typically the two 32-byte subkeys returned by
+// crypto.DeriveKeys(psk); see design §8.1 for the derivation contract.
+// crypto.DeriveKeys returns (encKey, authKey) in that order — the same order
+// this constructor accepts them.
 //
 // The constructor does not start any goroutines. The Manager is safe for
 // concurrent use immediately after construction.
-func NewManager(authKey [32]byte) *Manager {
+func NewManager(encKey, authKey [32]byte) *Manager {
 	return &Manager{
+		encKey:   encKey,
 		authKey:  authKey,
 		sessions: make(map[SessionID]*Session),
+		byCookie: make(map[[CookieSize]byte]*Session),
 	}
+}
+
+// EncKey returns the 32-byte AEAD key the manager was constructed with. The
+// syntfo secureConn (T3.4) calls this once at New time to obtain the key its
+// Seal / Open path uses. Returning a copy (Go arrays are value types) keeps
+// the manager's stored key inviolate even if a caller mutates the returned
+// array.
+func (m *Manager) EncKey() [32]byte {
+	return m.encKey
 }
 
 // Counters returns the Manager's drop-path counters. The returned pointer is
@@ -162,6 +191,7 @@ func (m *Manager) NewSession() *Session {
 	s := newSession(id, m.authKey)
 	m.mu.Lock()
 	m.sessions[id] = s
+	m.byCookie[s.cookie] = s
 	m.mu.Unlock()
 	return s
 }
@@ -231,16 +261,41 @@ func (m *Manager) BindSession(id SessionID) *Session {
 	}
 	s := newSession(id, m.authKey)
 	m.sessions[id] = s
+	m.byCookie[s.cookie] = s
 	m.mu.Unlock()
 	return s
 }
 
+// LookupByCookie returns the Session whose cached cookie equals the supplied
+// cookie, or nil if no such session is registered. The cookie ↔ session
+// mapping is unique with overwhelming probability (the cookie is a truncated
+// HMAC and acts as a 64-bit identifier), so a single registered session per
+// cookie is a safe invariant in practice.
+//
+// T3.4 uses this from the syntfo gate as a pre-decrypt fast reject: with
+// AEAD-wrapped payloads the gate can no longer read the SessionID from the
+// plaintext header, but it still sees the cookie in the TFO option. Looking
+// the session up by cookie preserves the "drop attacker packets before AEAD
+// open" property design-doc §8.4 calls for.
+//
+// Returning nil when no session matches is the gate's signal to drop and
+// increment the bad-cookie counter; the manager's own BadCookie counter is
+// NOT incremented from this method (gates are responsible for their own
+// bookkeeping — ValidateCookie still owns the counter when called).
+func (m *Manager) LookupByCookie(cookie [CookieSize]byte) *Session {
+	m.mu.RLock()
+	s := m.byCookie[cookie]
+	m.mu.RUnlock()
+	return s
+}
+
 // Session is one entry in the manager's session table. It carries the
-// SessionID, the cached cookie (computed once at construction), and the
-// per-session anti-replay filter. All fields are immutable after
-// construction except for ReplayFilter's internal state, which is itself
-// internally synchronized — Session is therefore safe for concurrent use
-// without any external locking.
+// SessionID, the cached cookie (computed once at construction), the
+// per-session anti-replay filter, and the per-session outbound sequence
+// counter (T3.4). All fields are immutable after construction except for
+// ReplayFilter's and seq's internal state, both of which are internally
+// synchronized — Session is therefore safe for concurrent use without any
+// external locking.
 type Session struct {
 	// ID is the 4-byte identifier the wire format (protocol.Message.SessionID)
 	// carries. The field is exported because callers stamp it onto outgoing
@@ -256,6 +311,17 @@ type Session struct {
 	// ReplayFilter() so T3.4 can wire it into the post-decrypt path; T3.2
 	// itself never calls Check.
 	replay *crypto.ReplayFilter
+
+	// seq is the per-session outbound sequence counter. Incremented by
+	// NextSeq() on each outgoing AEAD-wrapped data frame and stamped into the
+	// protocol.Message.Sequence field; the peer's anti-replay window (the
+	// replay field on the peer's Session) consults this value after AEAD
+	// Open succeeds. Starts at 0 so the first NextSeq() returns 1 — seq 0 is
+	// reserved for the plaintext HELLO/HELLO_ACK frames that bypass the AEAD
+	// path (those frames carry Sequence=0 because the receiver does not
+	// replay-check the handshake; the HMAC over the timestamped preamble
+	// already authenticates freshness).
+	seq atomic.Uint64
 }
 
 // newSession is the internal Session constructor. It derives the cookie once
@@ -273,6 +339,17 @@ func newSession(id SessionID, authKey [32]byte) *Session {
 		cookie: cookie,
 		replay: crypto.NewReplayFilter(),
 	}
+}
+
+// NextSeq returns the next outbound sequence number for this session,
+// monotonically increasing from 1 (seq 0 is reserved for the plaintext
+// handshake frames). Safe for concurrent use; concurrent callers each
+// observe a distinct value and no number is ever skipped or repeated.
+//
+// The counter is per-session, not global: the AEAD path's anti-replay window
+// is also per-session, so collisions across sessions are not a concern.
+func (s *Session) NextSeq() uint64 {
+	return s.seq.Add(1)
 }
 
 // Cookie returns HMAC-SHA256(authKey, sessionID)[:CookieSize]. The value is

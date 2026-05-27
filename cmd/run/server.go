@@ -38,6 +38,6 @@ func startServer(cfg *conf.Conf) {
 // gates traffic.
 func newSessionManager(cfg *conf.Conf) *session.Manager {
 	psk := []byte(cfg.Transport.KCP.Key)
-	_, authKey := crypto.DeriveKeys(psk)
-	return session.NewManager(authKey)
+	encKey, authKey := crypto.DeriveKeys(psk)
+	return session.NewManager(encKey, authKey)
 }

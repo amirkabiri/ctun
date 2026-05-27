@@ -3,6 +3,7 @@ package session
 import (
 	"bytes"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"go.uber.org/goleak"
@@ -30,8 +31,22 @@ var testAuthKey = func() [32]byte {
 	return k
 }()
 
+// testEncKey is the fixture encKey paired with testAuthKey. T3.4 extends
+// NewManager to take encKey as its first argument; tests previously called
+// NewManager(authKey) and now thread testEncKey through. The bytes are
+// arbitrary but distinct from testAuthKey so a caller that accidentally
+// swapped the two arguments surfaces immediately (cookie derivations would
+// differ).
+var testEncKey = func() [32]byte {
+	var k [32]byte
+	for i := range k {
+		k[i] = byte(0x80 + i)
+	}
+	return k
+}()
+
 func newTestManager() *Manager {
-	return NewManager(testAuthKey)
+	return NewManager(testEncKey, testAuthKey)
 }
 
 func TestManager_NewSession_GeneratesUniqueIDs(t *testing.T) {
@@ -117,8 +132,8 @@ func TestSession_Cookie_VariesWithKey(t *testing.T) {
 		keyB[i] = 0x22
 	}
 
-	mA := NewManager(keyA)
-	mB := NewManager(keyB)
+	mA := NewManager(testEncKey, keyA)
+	mB := NewManager(testEncKey, keyB)
 	// We can't NewSession with a chosen ID, so call BindSession which lets us
 	// pin the ID. BindSession derives the same cookie newSession would.
 	sA := mA.BindSession(id)
@@ -257,5 +272,72 @@ func TestManager_ConcurrentSessions(t *testing.T) {
 
 	if len(ids) != G {
 		t.Fatalf("expected %d unique SessionIDs, got %d", G, len(ids))
+	}
+}
+
+// TestSession_NextSeq_Monotonic locks in the T3.4 contract: NextSeq starts
+// at 1 (seq 0 is reserved for the plaintext handshake frames) and increases
+// by exactly one on every call. A regression that started at 0, skipped, or
+// repeated would trip this.
+func TestSession_NextSeq_Monotonic(t *testing.T) {
+	m := newTestManager()
+	s := m.NewSession()
+
+	const N = 1024
+	for i := uint64(1); i <= N; i++ {
+		got := s.NextSeq()
+		if got != i {
+			t.Fatalf("NextSeq call %d returned %d, want %d", i, got, i)
+		}
+	}
+}
+
+// TestSession_NextSeq_Concurrent stresses the atomic counter under heavy
+// contention. 100 goroutines × 100 calls = 10000 distinct sequence numbers,
+// each in [1, 10000]. Any duplicate, any skipped number, or any value
+// outside that range is a regression in the atomic.Uint64 contract.
+func TestSession_NextSeq_Concurrent(t *testing.T) {
+	m := newTestManager()
+	s := m.NewSession()
+
+	const G = 100
+	const Per = 100
+	const Total = G * Per
+
+	results := make([]uint64, Total)
+	var idx atomic.Uint64
+
+	var wg sync.WaitGroup
+	wg.Add(G)
+	for g := 0; g < G; g++ {
+		go func() {
+			defer wg.Done()
+			for i := 0; i < Per; i++ {
+				v := s.NextSeq()
+				results[idx.Add(1)-1] = v
+			}
+		}()
+	}
+	wg.Wait()
+
+	seen := make(map[uint64]struct{}, Total)
+	var maxSeq uint64
+	for _, v := range results {
+		if v == 0 {
+			t.Fatalf("NextSeq returned 0; seq 0 is reserved for handshake frames")
+		}
+		if _, dup := seen[v]; dup {
+			t.Fatalf("NextSeq returned duplicate %d", v)
+		}
+		seen[v] = struct{}{}
+		if v > maxSeq {
+			maxSeq = v
+		}
+	}
+	if len(seen) != Total {
+		t.Fatalf("expected %d distinct sequence numbers, got %d", Total, len(seen))
+	}
+	if maxSeq != Total {
+		t.Fatalf("max sequence number = %d, want %d", maxSeq, Total)
 	}
 }

@@ -51,12 +51,24 @@ var testAuthKey = func() [32]byte {
 	return k
 }()
 
+// testEncKey is the paired AEAD key, distinct from testAuthKey so the
+// manager stores them separately and a future swap between the two
+// argument positions of session.NewManager surfaces in cookie-derivation
+// failures rather than passing silently.
+var testEncKey = func() [32]byte {
+	var k [32]byte
+	for i := range k {
+		k[i] = byte(0x80 + i)
+	}
+	return k
+}()
+
 func TestSessionCookieProvider_UnboundReturnsZero(t *testing.T) {
 	// Pre-handshake (HELLO) sentinel: until a session is bound, the provider
 	// emits the all-zero cookie. design-doc §8.4 is explicit that this is
 	// the value the server's recv gate will (once T3.3 wires the AEAD
 	// layer) treat as "candidate HELLO".
-	mgr := session.NewManager(testAuthKey)
+	mgr := session.NewManager(testEncKey, testAuthKey)
 	p := NewSessionCookieProvider(mgr)
 
 	want := [CookieSize]byte{}
@@ -73,7 +85,7 @@ func TestSessionCookieProvider_BindStampsSessionCookie(t *testing.T) {
 	// Once a session is bound, Cookie() must return that session's cached
 	// HMAC-derived cookie verbatim. This is the post-handshake path that
 	// will be active on the wire after T3.3 completes the HELLO_ACK flow.
-	mgr := session.NewManager(testAuthKey)
+	mgr := session.NewManager(testEncKey, testAuthKey)
 	s := mgr.NewSession()
 	p := NewSessionCookieProvider(mgr)
 	p.Bind(s)
@@ -92,7 +104,7 @@ func TestSessionCookieProvider_UnbindRevertsToZero(t *testing.T) {
 	// Bind(nil) is permitted as a test convenience; the production wiring
 	// never calls it. Verify the documented semantics: it reverts the
 	// provider to the pre-handshake state.
-	mgr := session.NewManager(testAuthKey)
+	mgr := session.NewManager(testEncKey, testAuthKey)
 	p := NewSessionCookieProvider(mgr)
 	p.Bind(mgr.NewSession())
 	p.Bind(nil)
@@ -110,7 +122,7 @@ func TestSessionCookieProvider_ConcurrentReadsDuringBind(t *testing.T) {
 	// and that every observed cookie is one of the two valid choices
 	// (zero, sessionA.Cookie, or sessionB.Cookie). A future refactor that
 	// dropped the lock would trip this under -race.
-	mgr := session.NewManager(testAuthKey)
+	mgr := session.NewManager(testEncKey, testAuthKey)
 	sA := mgr.NewSession()
 	sB := mgr.NewSession()
 	p := NewSessionCookieProvider(mgr)

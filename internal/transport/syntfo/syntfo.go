@@ -85,6 +85,14 @@ type Transport struct {
 	// no manager was supplied (tests, the legacy static-cookie path).
 	mgr *session.Manager
 
+	// secure is the AEAD-wrapping net.PacketConn that fronts conn when a
+	// session manager is wired (T3.4). It is what PacketConn() returns to
+	// KCP, so all KCP-level traffic goes through AEAD seal/open and
+	// anti-replay transparently. Nil when no manager was supplied —
+	// PacketConn() then falls back to the raw socket.PacketConn for legacy
+	// / test wiring.
+	secure *secureConn
+
 	// helloMu guards helloHandler. The handler is normally installed once
 	// at server-side startup and then read on every inbound HELLO frame,
 	// so an RWMutex would also work; sync.Mutex is simpler and the install
@@ -157,6 +165,26 @@ func New(cfg transport.Config) (transport.Transport, error) {
 		cookies:  cookies,
 		counters: NewCounters(),
 		mgr:      mgr,
+	}
+
+	// T3.4: when a session manager (and therefore an encKey) is wired,
+	// build the secureConn that fronts the raw socket.PacketConn with the
+	// AEAD seal/open + anti-replay layer. PacketConn() will return this
+	// secureConn to KCP; bare *socket.PacketConn is returned only when
+	// no manager is wired (legacy / test paths).
+	if mgr != nil {
+		var binding sessionBinding
+		// SessionCookieProvider doubles as the secureConn's binding —
+		// it already tracks the bound *session.Session for cookie
+		// stamping, so we reuse it for the WriteTo path's session
+		// lookup. Type-assertion is enough; non-session providers
+		// (the StaticCookieProvider used by tests / pre-T3.2 wiring)
+		// leave binding nil, which on the server side is fine (server
+		// secureConns don't WriteTo in T3.4).
+		if scp, ok := cookies.(*SessionCookieProvider); ok {
+			binding = scp
+		}
+		t.secure = newSecureConn(pConn, mgr, t.counters, binding)
 	}
 
 	// Install the T1.2 SYN-option builder: every emitted SYN carries the
@@ -261,23 +289,22 @@ func (t *Transport) gateOptions(options []layers.TCPOption, payload []byte) bool
 		return true
 	}
 
-	// Unmarshal the inner protocol frame to reach Flags / SessionID. The
-	// payload slice aliases the pcap buffer, so we can pass it directly to
-	// protocol.Unmarshal — which copies the Payload out into a fresh slice
-	// owned by the returned *Message. The header bytes are decoded into
-	// scalar fields, not retained.
-	if len(payload) == 0 {
-		t.counters.incMalformedFrame()
-		return false
-	}
-	msg, err := protocol.Unmarshal(payload)
-	if err != nil {
-		t.counters.incMalformedFrame()
-		return false
-	}
-
 	isZeroCookie := cookie == ([CookieSize]byte{})
 	if isZeroCookie {
+		// Zero-cookie sentinel routes the HELLO path. The HELLO payload is
+		// plaintext (handshake frames bypass the AEAD wrapper per design
+		// §8.4 and the T3.3 plaintext-handshake decision), so the gate can
+		// still parse it directly. Anything else with the zero cookie is
+		// either a buggy client or a probe and gets dropped.
+		if len(payload) == 0 {
+			t.counters.incMalformedFrame()
+			return false
+		}
+		msg, err := protocol.Unmarshal(payload)
+		if err != nil {
+			t.counters.incMalformedFrame()
+			return false
+		}
 		if msg.Flags != protocol.FlagHello {
 			// Non-HELLO frame with the zero sentinel cookie. Per design
 			// §8.4 the zero cookie is reserved for HELLO. Drop.
@@ -307,22 +334,28 @@ func (t *Transport) gateOptions(options []layers.TCPOption, payload []byte) bool
 		return false
 	}
 
-	// Non-zero cookie path: validate against the session table.
-	var id session.SessionID
-	// Frame.SessionID is a uint32 big-endian wire field; SessionID is a
-	// [4]byte array. Decode in big-endian order so the cookie binding
-	// (HMAC over SessionID's bytes) matches what the cookie provider
-	// emits.
-	id[0] = byte(msg.SessionID >> 24)
-	id[1] = byte(msg.SessionID >> 16)
-	id[2] = byte(msg.SessionID >> 8)
-	id[3] = byte(msg.SessionID)
-	if _, ok := t.mgr.ValidateCookie(id, cookie); !ok {
-		// The manager's own BadCookie counter already ticked inside
-		// ValidateCookie. We ALSO tick the syntfo-side counter so
-		// transport-level metrics show the drop without needing to
-		// reach into the session package's counters.
+	// Non-zero cookie path: with AEAD-wrapped data frames (T3.4) the inner
+	// SessionID is no longer visible in plaintext, so we cannot
+	// ValidateCookie by reading it out of the payload. Instead we look the
+	// session up by its cookie — the cookie is HMAC(authKey, sessionID)[:8]
+	// and is unique per session with overwhelming probability, so this is
+	// a sound pre-decrypt fast-reject (design §8.4: "سرور با چک سریع
+	// cookie می‌تواند پکت‌های مهاجم را قبل از decrypt دور بریزد").
+	//
+	// secureConn.ReadFrom performs the actual AEAD Open + SessionID
+	// integrity check (the AEAD tag covers the header, so a forger who
+	// happens to know a valid cookie still cannot fake the inner
+	// SessionID); the gate's job is to short-circuit obvious garbage
+	// before we pay for an AEAD Open call.
+	if t.mgr.LookupByCookie(cookie) == nil {
 		t.counters.incBadCookieValidator()
+		// Mirror the T3.3 dual-counter pattern: bump the manager's
+		// BadCookie counter too so observers that watch only the
+		// session-layer metrics still see the drop. The manager's
+		// ValidateCookie used to do this internally; the gate has
+		// taken over the bookkeeping responsibility now that it no
+		// longer calls ValidateCookie on the hot path.
+		t.mgr.Counters().BadCookie.Add(1)
 		return false
 	}
 	return true
@@ -352,10 +385,20 @@ func (t *Transport) Counters() *Counters {
 	return t.counters
 }
 
-// PacketConn returns the underlying net.PacketConn. This is the seam KCP
-// (which predates the Transport interface) hooks into; it lives only on the
-// concrete syntfo.Transport type and is not part of the design-§7.1 interface.
+// PacketConn returns the net.PacketConn KCP consumes. When the transport
+// was constructed with a session manager (the production path), this is
+// the AEAD-wrapping secureConn from T3.4 — KCP sees plaintext bytes and
+// has no notion of the AEAD layer underneath. When no manager is wired
+// (legacy / test paths), the bare socket.PacketConn is returned so the
+// pre-T3.4 plaintext behaviour is preserved.
+//
+// The seam itself (PacketConn() returning a net.PacketConn) predates the
+// Transport interface and lives only on the concrete syntfo.Transport
+// type; it is not part of design-§7.1's interface.
 func (t *Transport) PacketConn() net.PacketConn {
+	if t.secure != nil {
+		return t.secure
+	}
 	return t.conn
 }
 
