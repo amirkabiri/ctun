@@ -687,9 +687,7 @@ Items intentionally deferred from a task's original DoD, with reason. Pick these
 ### From T0.1
 
 - **GitHub `<owner>/ctun` repo creation** — N/A under the current coordinator policy (no remotes, no pushing). Re-evaluate when the project moves to a hosted repo. The `upstream` remote *is* configured locally so future `git fetch upstream` works.
-- **`server` / `client` subcommands in `--help`** — Upstream paqet exposes a single config-driven `run` subcommand instead of separate `server`/`client`. The T0.1 DoD's enumeration was aspirational. Splitting `run` into two subcommands is a UX refactor and should be filed as its own task in Phase 4 if we still want it; current docs in design-doc.md describe `ctun server`/`ctun client` invocations, so this divergence will need reconciling either in code (split the command) or in the design doc (document `ctun run` instead).
-- **`example/*.yaml.example` config comments** — Still contain stray "paqet" strings in comment headers. Sweep in T4.6 (full doc refresh).
-- **`Makefile` rename** — Upstream has no `Makefile`; the T0.1 DoD item is a no-op. Remove the line in a future doc cleanup.
+- **`server` / `client` subcommands in `--help`** — Upstream paqet exposes a single config-driven `run` subcommand instead of separate `server`/`client`. The T0.1 DoD's enumeration was aspirational. Splitting `run` into two subcommands is a UX refactor and should be filed as its own task in Phase 4 if we still want it; current docs in design-doc.md describe `ctun server`/`ctun client` invocations, so this divergence will need reconciling either in code (split the command) or in the design doc (document `ctun run` instead). T4.6 documented `ctun run` in the README to match the binary; the design-doc reconciliation is still open.
 - **`internal/conf/kcp_block.go` PBKDF2 salt `"paqet"`** — Deliberately preserved because it is a wire-protocol constant; T2.1 replaces the whole derivation with HKDF, which retires this string organically.
 
 ### From T0.2

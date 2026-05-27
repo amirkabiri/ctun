@@ -1,6 +1,12 @@
 // Package integration contains end-to-end tests that drive the ctun binary
 // as a subprocess. They require root (raw sockets / pcap) and are skipped
 // otherwise.
+//
+// This file holds the cross-test helpers (fixture rendering, port allocation,
+// HTTP test server, subprocess management, SOCKS5 driver, binary build cache)
+// that every integration test shares. The helpers were originally introduced
+// in smoke_paqet_baseline_test.go (T0.2) and were extracted here when T4.6
+// deleted the baseline file.
 package integration
 
 import (
@@ -27,34 +33,6 @@ import (
 	"golang.org/x/net/proxy"
 )
 
-// Test_Smoke_PaqetBaseline boots an unmodified-default ctun server + client
-// (paqet's [PA] flag profile) on loopback and drives an HTTP GET through the
-// SOCKS5 listener exposed by the client. It is a baseline so any later breakage
-// in ctun-specific code is attributable to that change rather than the inherited
-// transport. T1.5 supersedes this test and T4.6 removes it.
-//
-// Subtests:
-//   - first-run:  full boot/teardown cycle, asserts 200 and expected body.
-//   - second-run: identical to first-run; proves teardown is clean and resources
-//     (ports, pcap handles, child PIDs) do not leak.
-//
-// To run a single sub-test:
-//
-//	sudo go test ./test/integration/ -run 'Smoke_PaqetBaseline/first-run' -v
-func Test_Smoke_PaqetBaseline(t *testing.T) {
-	t.Skip("superseded by Test_Smoke_SynTfo; will be deleted in T4.6")
-	skipUnlessRunnable(t)
-
-	bin := buildCtunBinary(t)
-
-	t.Run("first-run", func(t *testing.T) {
-		runBaselineRoundTrip(t, bin)
-	})
-	t.Run("second-run", func(t *testing.T) {
-		runBaselineRoundTrip(t, bin)
-	})
-}
-
 // skipUnlessRunnable centralises the gating for the whole integration suite.
 // The defaults are aggressively conservative: a contributor running
 // `go test ./...` as a non-root user should never see a failure here.
@@ -71,56 +49,6 @@ func skipUnlessRunnable(t *testing.T) {
 			who = u.Username
 		}
 		t.Skipf("integration test requires root for raw sockets / pcap (running as %s); rerun with sudo and -short=false", who)
-	}
-}
-
-// runBaselineRoundTrip is the shared per-iteration body. It is idempotent in
-// the sense that every call gets its own tempdir, its own free port pair, and
-// its own subprocess group.
-func runBaselineRoundTrip(t *testing.T, ctunBin string) {
-	t.Helper()
-
-	tunnelPort, socksPort := allocLoopbackPorts(t)
-	iface := lookupTestIface()
-	sharedKey := newSharedKey(t)
-
-	// Spin the destination HTTP server up first so the server side has
-	// somewhere to dial as soon as a SOCKS5 CONNECT arrives.
-	const expectedBody = "ctun-baseline-ok"
-	httpAddr := startTestHTTPServer(t, expectedBody)
-
-	// Materialise the YAML fixtures with the per-iteration parameters.
-	scratch := t.TempDir()
-	serverCfg := renderFixture(t, "server-pa.yaml", filepath.Join(scratch, "server.yaml"), fixtureParams{
-		TunnelPort: tunnelPort,
-		SocksPort:  socksPort,
-		Iface:      iface,
-		RouterMAC:  loopbackRouterMAC,
-		SharedKey:  sharedKey,
-	})
-	clientCfg := renderFixture(t, "client-pa.yaml", filepath.Join(scratch, "client.yaml"), fixtureParams{
-		TunnelPort: tunnelPort,
-		SocksPort:  socksPort,
-		Iface:      iface,
-		RouterMAC:  loopbackRouterMAC,
-		SharedKey:  sharedKey,
-	})
-
-	// Start server, then client. Cleanup runs in reverse order via t.Cleanup.
-	serverLog := startCtun(t, ctunBin, serverCfg, "server")
-	waitFor(t, fmt.Sprintf("server listening on :%d", tunnelPort), 10*time.Second, func() bool {
-		return tcpPortListening("127.0.0.1", tunnelPort)
-	}, serverLog)
-
-	clientLog := startCtun(t, ctunBin, clientCfg, "client")
-	waitFor(t, fmt.Sprintf("SOCKS5 listening on :%d", socksPort), 10*time.Second, func() bool {
-		return tcpPortListening("127.0.0.1", socksPort)
-	}, clientLog)
-
-	// Drive an HTTP request *through* the SOCKS5 listener.
-	body := doHTTPThroughSOCKS5(t, fmt.Sprintf("127.0.0.1:%d", socksPort), "http://"+httpAddr+"/baseline")
-	if got := string(body); got != expectedBody {
-		t.Fatalf("unexpected body via tunnel: got %q want %q", got, expectedBody)
 	}
 }
 
