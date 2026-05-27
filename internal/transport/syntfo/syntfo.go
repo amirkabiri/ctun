@@ -23,10 +23,12 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"sync"
 
 	"github.com/gopacket/gopacket/layers"
 
 	"ctun/internal/conf"
+	"ctun/internal/protocol"
 	"ctun/internal/session"
 	"ctun/internal/socket"
 	"ctun/internal/transport"
@@ -82,7 +84,33 @@ type Transport struct {
 	// gateOptions without another constructor-API change. It may be nil when
 	// no manager was supplied (tests, the legacy static-cookie path).
 	mgr *session.Manager
+
+	// helloMu guards helloHandler. The handler is normally installed once
+	// at server-side startup and then read on every inbound HELLO frame,
+	// so an RWMutex would also work; sync.Mutex is simpler and the install
+	// path is rare.
+	helloMu      sync.Mutex
+	helloHandler HelloHandler
 }
+
+// HelloHandler is the per-Transport hook the gate dispatches to when an
+// inbound frame is identified as a HELLO (Flags=FlagHello, SessionID=0,
+// cookie=zero). The hook is the bridge between the per-packet recv path
+// and the higher-level session.RunServerHandshake call: the handler is
+// responsible for validating the HELLO bytes, minting a session via the
+// session.Manager, and sending HELLO_ACK back via Transport.Send.
+//
+// frame is the parsed protocol.Message; the handler reads frame.Payload
+// (the HELLO bytes) and the source address from src. The payload slice
+// aliases the pcap buffer and MUST NOT be retained past the handler's
+// return.
+//
+// The gate calls the handler synchronously on the recv hot path. The
+// handler should be fast — production wiring delegates heavy lifting
+// (e.g. waiting for the network) to a worker goroutine spawned inside
+// the handler. T3.3 only ships the hook; full server-side wiring lands
+// in T3.5.
+type HelloHandler func(ctx context.Context, frame *protocol.Message, src net.Addr)
 
 // New is the Factory registered under Name. It opens the underlying pcap-based
 // packet conn, installs the SYN-TFO option builder + the T0.3 seq-entropy
@@ -154,61 +182,166 @@ func New(cfg transport.Config) (transport.Transport, error) {
 	return t, nil
 }
 
-// gateOptions is the receive-side option-validation hook installed via
+// gateOptions is the receive-side validation hook installed via
 // SetSYNGate. It returns true to accept a packet for the upper layer or
-// false to drop it; on drop it increments the appropriate counter.
+// false to drop it; on drop it increments the appropriate counter. T3.3
+// extended the signature with a payload argument so the gate can inspect
+// the inner protocol frame (cookie validation + HELLO routing need the
+// SessionID / Flags from the framed payload, not just the TCP options).
 //
-// Cookie validation status (T3.2 — Option A from the task brief):
+// Decision tree per design §8.4 (also recorded in the T3.3 brief):
 //
-// The HMAC-over-SessionID validation step from design §8.4 is **NOT**
-// performed here yet. The reason is that the SessionID lives in the
-// protocol header (T3.1), which lives inside the AEAD ciphertext (T3.3+);
-// at T3.2 the AEAD layer has not been wired onto the outbound path so the
-// gate has no SessionID to look up. Inventing a cookie validator that
-// ignored the SessionID-in-header (Option B) would create the illusion of
-// authentication while accepting any cookie that ever matched any known
-// session — strictly worse than no check, because it would silently mask
-// the missing piece. T3.2 therefore stays in scope: option *shape* is
-// enforced (T1.3); the *cookie* contents are decoded-but-not-validated and
-// will be cross-checked against the post-AEAD SessionID once T3.3 lands.
+//  1. TFO option missing → drop, incNoTFO.
+//  2. TFO option malformed → drop, incMalformedTFO.
+//  3. Inner protocol payload empty or fails Unmarshal → drop,
+//     incMalformedFrame. (No session manager: pass through unchanged
+//     for tests / non-syntfo deployments — see step 4.)
+//  4. No *session.Manager wired (legacy / test mode) → accept on
+//     TFO shape alone. Same behaviour as T1.3 — preserves the existing
+//     tests and the static-cookie path's "we trust whoever set us up"
+//     posture.
+//  5. Cookie is all-zero (HELLO sentinel):
+//     - Flags == FlagHello → accept (and dispatch to helloHandler if
+//     installed). The HELLO path bypasses session lookup because the
+//     session is not yet minted.
+//     - Otherwise → drop, incNonHelloZeroCookie. Non-HELLO frames with
+//     the zero sentinel are either buggy clients or probes; no
+//     legitimate cookie matches the zero value (HMAC outputs are
+//     indistinguishable from random, so HMAC=000...0 has cryptographic
+//     probability 2^-64 per session).
+//  6. Cookie is non-zero → run mgr.ValidateCookie(frame.SessionID, cookie).
+//     - Accept on hit (session.Counters.BadCookie does NOT tick on the
+//     happy path).
+//     - Drop on miss, incBadCookieValidator (and the manager's own
+//     BadCookie counter ticks inside ValidateCookie itself). The two
+//     counters exist for different audiences: the manager's tells the
+//     session-layer story (which validator decided to reject), the
+//     syntfo one tells the transport-layer story (the syntfo gate
+//     dropped a packet for cookie reasons).
 //
-// HELLO (zero-cookie) handling has the same caveat: design §8.4 says a
-// zero cookie should be accepted only when the decrypted frame's Flags ==
-// FlagHello. We cannot enforce that until AEAD reaches this gate. The
-// SessionCookieProvider on the send side already emits the zero sentinel
-// before Bind is called, so the wire format will be correct from day one
-// once T3.3 turns the validator on.
-//
-// TODO(T3.3): after AEAD is wired onto the recv path, decode the protocol
-// header here, route the cookie through t.mgr.ValidateCookie(sessionID,
-// cookie), and bump the BadCookie counter on reject. The all-zero cookie
-// path should only accept frames whose decrypted Flags equals FlagHello.
+// AEAD-on-frame note: T3.3 chooses option (a) — handshake is plaintext
+// with HMAC — so the gate can Unmarshal the inner protocol frame
+// directly. Data frames will be AEAD-wrapped from T3.4 onwards; when
+// that lands this gate will need to either (i) decrypt non-HELLO frames
+// before Unmarshal or (ii) defer cookie validation to the post-decrypt
+// step. The T3.3 brief explicitly defers anti-replay wiring to T3.4, so
+// the AEAD-on-data-frames decision rides with it. For T3.3 the gate's
+// data-frame branch trusts the SessionID it reads from a plaintext
+// header — which is fine because nothing in T3.3 actually sends a
+// non-HELLO frame yet (the upper layer is still the legacy paqet path,
+// and it is not yet wired to mint AEAD-wrapped frames).
 //
 // Exposed as a method (rather than an anonymous closure inside New) so
 // tests can drive the gate directly without spinning up a pcap handle.
-// The method only touches Transport.counters; it is safe for concurrent
-// use because the counter implementation is built on atomic.Uint64.
-func (t *Transport) gateOptions(options []layers.TCPOption) bool {
-	_, status := classifyTFO(options)
+// The method takes the syntfo Counters via t.counters; it is safe for
+// concurrent use because both Counters and session.Counters are built on
+// atomic.Uint64.
+func (t *Transport) gateOptions(options []layers.TCPOption, payload []byte) bool {
+	cookie, status := classifyTFO(options)
 	switch status {
-	case tfoStatusOK:
-		// See the long-form comment above for why the cookie value is
-		// discarded here in T3.2. The wiring lands in T3.3 once AEAD
-		// decryption gives us the SessionID to look up.
-		return true
 	case tfoStatusMissing:
 		t.counters.incNoTFO()
 		return false
 	case tfoStatusMalformed:
 		t.counters.incMalformedTFO()
 		return false
+	case tfoStatusOK:
+		// fallthrough into the cookie / inner-frame logic below.
 	default:
 		// Defensive — classifyTFO only returns the three statuses above.
-		// If a future refactor adds a new one, count it as a generic
-		// missing rather than panic on the hot path.
 		t.counters.incNoTFO()
 		return false
 	}
+
+	// If no session manager was wired, preserve T1.3 semantics: accept on
+	// TFO shape alone. This keeps the static-cookie / test path working
+	// unchanged and is the documented fallback resolveCookieProvider
+	// picks when neither ExtraParams key is set.
+	if t.mgr == nil {
+		return true
+	}
+
+	// Unmarshal the inner protocol frame to reach Flags / SessionID. The
+	// payload slice aliases the pcap buffer, so we can pass it directly to
+	// protocol.Unmarshal — which copies the Payload out into a fresh slice
+	// owned by the returned *Message. The header bytes are decoded into
+	// scalar fields, not retained.
+	if len(payload) == 0 {
+		t.counters.incMalformedFrame()
+		return false
+	}
+	msg, err := protocol.Unmarshal(payload)
+	if err != nil {
+		t.counters.incMalformedFrame()
+		return false
+	}
+
+	isZeroCookie := cookie == ([CookieSize]byte{})
+	if isZeroCookie {
+		if msg.Flags != protocol.FlagHello {
+			// Non-HELLO frame with the zero sentinel cookie. Per design
+			// §8.4 the zero cookie is reserved for HELLO. Drop.
+			t.counters.incNonHelloZeroCookie()
+			return false
+		}
+		// Candidate HELLO. Dispatch to the registered handler (if any)
+		// and signal "drop" to the upper layer so the HELLO bytes do
+		// not bubble up to KCP (which would see them as garbage). The
+		// upper layer does not need to know about HELLO — the handler
+		// owns the post-validation work.
+		t.helloMu.Lock()
+		h := t.helloHandler
+		t.helloMu.Unlock()
+		if h != nil {
+			// We do not have an addr here at the gate level — the
+			// gate's contract from internal/socket only passes
+			// options+payload. T3.3 ships the hook with src=nil and
+			// expects T3.5's full wiring to extend the gate plumbing
+			// to surface the source address; until then the handler
+			// must reach the source via a side channel (the recv
+			// loop's own bookkeeping). The zero-cookie HELLO routing
+			// is what T3.3 wires today; the source-address plumbing
+			// is the open follow-up.
+			h(context.Background(), msg, nil)
+		}
+		return false
+	}
+
+	// Non-zero cookie path: validate against the session table.
+	var id session.SessionID
+	// Frame.SessionID is a uint32 big-endian wire field; SessionID is a
+	// [4]byte array. Decode in big-endian order so the cookie binding
+	// (HMAC over SessionID's bytes) matches what the cookie provider
+	// emits.
+	id[0] = byte(msg.SessionID >> 24)
+	id[1] = byte(msg.SessionID >> 16)
+	id[2] = byte(msg.SessionID >> 8)
+	id[3] = byte(msg.SessionID)
+	if _, ok := t.mgr.ValidateCookie(id, cookie); !ok {
+		// The manager's own BadCookie counter already ticked inside
+		// ValidateCookie. We ALSO tick the syntfo-side counter so
+		// transport-level metrics show the drop without needing to
+		// reach into the session package's counters.
+		t.counters.incBadCookieValidator()
+		return false
+	}
+	return true
+}
+
+// SetHelloHandler installs the per-Transport HELLO dispatcher used by the
+// receive-side gate. The server-side cmd wiring (T3.5) registers a handler
+// that drives session.RunServerHandshake under a worker goroutine; tests
+// register a recording handler. Passing nil clears the handler.
+//
+// Concurrency: the handler is read by the gate hot path on every inbound
+// HELLO frame, so the install path takes the small helloMu mutex; the gate
+// takes it too while loading the pointer. The cost is one uncontended
+// mutex acquire per HELLO — negligible compared to the Unmarshal call the
+// gate already pays.
+func (t *Transport) SetHelloHandler(h HelloHandler) {
+	t.helloMu.Lock()
+	t.helloHandler = h
+	t.helloMu.Unlock()
 }
 
 // Counters returns the SYN-TFO Transport's drop-path counters. The future

@@ -48,6 +48,39 @@ type Counters struct {
 	// scanner sweeping the port, versus a partial implementation or a
 	// corrupted middlebox).
 	droppedMalformedTFO atomic.Uint64
+
+	// droppedBadCookieValidator is incremented when a packet's TFO option
+	// is well-formed (shape OK) but the cookie itself is rejected by the
+	// session-table validator. T3.3 wires this counter: gateOptions calls
+	// mgr.ValidateCookie on every non-HELLO inbound frame, and a mismatch
+	// (unknown SessionID or wrong HMAC) bumps this counter and drops the
+	// packet. The split between this counter and session.Counters.BadCookie
+	// is the T3.3 brief's "DroppedBadCookieValidator distinguishes from
+	// T1.3's DroppedNoTFO / DroppedMalformedTFO" guidance: the manager's
+	// own counter still ticks (it is the source of truth for validator
+	// outcomes), and this one ticks alongside so a syntfo-level metrics
+	// scraper sees the drop in the syntfo counter inventory without
+	// having to reach into the session package.
+	droppedBadCookieValidator atomic.Uint64
+
+	// droppedNonHelloZeroCookie is incremented when the gate observes a
+	// non-HELLO frame stamped with the all-zero cookie sentinel. The
+	// HELLO sentinel is reserved per design §8.4 for first-contact
+	// handshake frames only; any other Flags value carrying the zero
+	// cookie is either a buggy client or a probe and is dropped without
+	// a session lookup (since there is no session yet, ValidateCookie
+	// would also reject it, but the rejection path through this counter
+	// is faster and more diagnostic than a no-op session lookup).
+	droppedNonHelloZeroCookie atomic.Uint64
+
+	// droppedMalformedFrame is incremented when the inner protocol
+	// payload fails protocol.Unmarshal — truncated, length-mismatched, or
+	// unknown Flags. A malformed inner frame is a sign of a corrupted
+	// packet (or a probe carrying random bytes after a valid TFO option),
+	// not a security event per se; it lives next to the cookie counters
+	// because the gate is the first place we can detect it on the
+	// receive path.
+	droppedMalformedFrame atomic.Uint64
 }
 
 // NewCounters returns a Counters initialised to zero. Tests construct one
@@ -69,6 +102,29 @@ func (c *Counters) DroppedMalformedTFO() uint64 {
 	return c.droppedMalformedTFO.Load()
 }
 
+// DroppedBadCookieValidator returns the current value of the
+// dropped_bad_cookie_validator counter. T3.3 ticks this whenever a packet
+// arrives with a well-formed TFO option whose cookie does not match any
+// registered session.
+func (c *Counters) DroppedBadCookieValidator() uint64 {
+	return c.droppedBadCookieValidator.Load()
+}
+
+// DroppedNonHelloZeroCookie returns the current value of the
+// dropped_non_hello_zero_cookie counter. T3.3 ticks this whenever a packet
+// stamps the all-zero (HELLO) cookie sentinel but the inner frame's Flags
+// is not FlagHello.
+func (c *Counters) DroppedNonHelloZeroCookie() uint64 {
+	return c.droppedNonHelloZeroCookie.Load()
+}
+
+// DroppedMalformedFrame returns the current value of the
+// dropped_malformed_frame counter. T3.3 ticks this whenever the inner
+// protocol payload fails Unmarshal.
+func (c *Counters) DroppedMalformedFrame() uint64 {
+	return c.droppedMalformedFrame.Load()
+}
+
 // incNoTFO increments the dropped_no_tfo counter. Package-private because
 // only the receive-path gate has the authority to decide a packet should be
 // dropped for missing TFO.
@@ -80,4 +136,22 @@ func (c *Counters) incNoTFO() {
 // private for the same reason as incNoTFO.
 func (c *Counters) incMalformedTFO() {
 	c.droppedMalformedTFO.Add(1)
+}
+
+// incBadCookieValidator increments the dropped_bad_cookie_validator
+// counter. Package-private.
+func (c *Counters) incBadCookieValidator() {
+	c.droppedBadCookieValidator.Add(1)
+}
+
+// incNonHelloZeroCookie increments the dropped_non_hello_zero_cookie
+// counter. Package-private.
+func (c *Counters) incNonHelloZeroCookie() {
+	c.droppedNonHelloZeroCookie.Add(1)
+}
+
+// incMalformedFrame increments the dropped_malformed_frame counter.
+// Package-private.
+func (c *Counters) incMalformedFrame() {
+	c.droppedMalformedFrame.Add(1)
 }

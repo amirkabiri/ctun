@@ -66,10 +66,9 @@ const CookieSize = 8
 // pointer chasing.
 type SessionID [4]byte
 
-// Counters holds the manager's drop-path counters. Today only BadCookie is
-// populated; future counters listed in Cross-Cutting Concerns ("Metrics")
-// of docs/implementation-doc.md slot in alongside it with the same
-// atomic.Uint64 storage.
+// Counters holds the manager's drop-path counters. Future counters listed
+// in Cross-Cutting Concerns ("Metrics") of docs/implementation-doc.md slot
+// in alongside the existing fields with the same atomic.Uint64 storage.
 //
 // The struct is referenced by pointer (via Manager.Counters) so callers
 // observe live values without any copy-and-staleness footgun. The fields are
@@ -81,6 +80,21 @@ type Counters struct {
 	// fails. Maps to the design-doc / Cross-Cutting Concerns counter named
 	// "dropped_bad_cookie".
 	BadCookie atomic.Uint64
+
+	// HandshakeBadHMAC is incremented every time RunServerHandshake rejects a
+	// HELLO because the HMAC over the timestamped preamble does not validate
+	// under the server's authKey. Maps to the design-doc / Cross-Cutting
+	// Concerns counter named "dropped_handshake_bad_hmac". The single most
+	// likely cause is a PSK mismatch between client and server.
+	HandshakeBadHMAC atomic.Uint64
+
+	// HandshakeStaleTimestamp is incremented every time RunServerHandshake
+	// rejects a HELLO because its timestamp lies outside the server's
+	// ±ClockSkewTolerance window. Distinct from HandshakeBadHMAC so an
+	// operator can tell a clock-drift problem (this counter) apart from a
+	// PSK-mismatch problem (HandshakeBadHMAC). Both increments are
+	// silent — no outbound packets, no log lines, per design §8.4.
+	HandshakeStaleTimestamp atomic.Uint64
 }
 
 // Manager owns the process's session table and the authKey used to derive
