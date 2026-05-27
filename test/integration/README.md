@@ -29,6 +29,11 @@ sudo go test ./test/integration/ -v
 # SYN-TFO end-to-end (the canonical Phase-1 integration test):
 sudo go test ./test/integration/ -run Smoke_SynTfo -v
 
+# Phase-3 secure-tunnel suite (sudo for the full-stack tests; non-sudo
+# in-memory variants always run):
+sudo go test ./test/integration/ -run SecureTunnel -v
+go test ./test/integration/ -run SecureTunnel -v
+
 # Just the baseline (quarantined — SKIPs immediately):
 sudo go test ./test/integration/ -run Smoke_PaqetBaseline -v
 
@@ -57,6 +62,40 @@ go test -short ./...
   `second-run` in a single `go test` invocation so teardown leaks surface on
   the second iteration. T4.5's CI matrix is expected to wire this test in as
   the Phase-1 integration gate.
+
+- `Test_AntiReplay_ClientSendsN_AttackerReinjectsFirst` (T3.4, runs without
+  sudo) — wires two syntfo secureConn halves through an in-memory pipe,
+  sends N legitimate packets, has an "attacker" re-inject the first sealed
+  bytes mid-stream, and asserts every payload was processed exactly once,
+  the replay counter ticked exactly once, and no AEAD-open-fail or
+  unknown-session drops occurred. Skipped under `-short`.
+
+- `Test_SecureTunnel` (T3.5, sudo-gated) — Phase-3 end-to-end secure tunnel.
+  Boots ctun server + client with `cipher: chacha20poly1305` and
+  `transport_impl: "syn-tfo"` and exercises the full stack (SYN-TFO +
+  ChaCha20-Poly1305 + HKDF + anti-replay + HELLO/HELLO_ACK handshake) by
+  driving an HTTP GET through the SOCKS5 listener and asserting the
+  expected body. Runs `first-run` and `second-run` like `Smoke_SynTfo`.
+
+- `Test_SecureTunnel_WrongPSK_ServerSilent` (T3.5, sudo-gated) — boots
+  server and client with mismatched PSKs, drives an HTTP request through
+  SOCKS5, asserts the client request times out within ~20 s, and confirms
+  via pcap that the server emitted zero packets from its tunnel port —
+  the design-doc §8.4 "silent drop" property.
+
+- `Test_SecureTunnel_WrongPSK_HandshakeFails` (T3.5, runs without sudo) —
+  in-memory variant of the wrong-PSK case. Drives `RunClientHandshake`
+  with a `Sender` that pushes HELLOs into a channel processed by a
+  `RunServerHandshake` goroutine using a mismatched authKey. Asserts the
+  client returns `ErrHandshakeTimeout` / `DeadlineExceeded` and the server
+  emitted zero HELLO_ACK bytes. Skipped under `-short`.
+
+- `Test_SecureTunnel_TamperedCiphertext_DropAndRecover` (T3.5, runs without
+  sudo) — in-memory variant exercising "byte flipped in flight". Sends a
+  packet, flips a byte past the AEAD nonce while it sits in the receiver's
+  inbox, sends a clean follow-up packet, asserts the AEAD-open-fail
+  counter ticked once and the clean payload round-tripped. Skipped under
+  `-short`.
 
 ## Quarantined (skipped)
 

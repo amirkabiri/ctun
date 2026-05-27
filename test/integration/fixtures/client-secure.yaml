@@ -1,0 +1,41 @@
+# T3.5 secure-tunnel fixture (client) — explicit `transport_impl: "syn-tfo"`
+# AND `cipher: chacha20poly1305`.
+#
+# Derived from client-syntfo.yaml (the Phase-1 baseline fixture T1.5 uses).
+# The only material differences are:
+#
+#   - top-level `cipher: "chacha20poly1305"` — selects the AEAD wrapper that
+#     T2.2 added to the config schema, T3.4 wired into the data path, and
+#     T3.5 now exercises end-to-end.
+#
+# Placeholders are identical to client-syntfo.yaml — see that file for the
+# variable definitions.
+role: "client"
+
+log:
+  level: "warn"
+
+transport_impl: "syn-tfo"
+cipher: "chacha20poly1305"
+
+socks5:
+  - listen: "127.0.0.1:{{.SocksPort}}"
+
+network:
+  interface: "{{.Iface}}"
+  ipv4:
+    addr: "127.0.0.1:0"
+    router_mac: "{{.RouterMAC}}"
+  tcp:
+    local_flag: ["S"]
+    remote_flag: ["S"]
+
+server:
+  addr: "127.0.0.1:{{.TunnelPort}}"
+
+transport:
+  protocol: "kcp"
+  conn: 1
+  kcp:
+    mode: "fast"
+    key: "{{.SharedKey}}"

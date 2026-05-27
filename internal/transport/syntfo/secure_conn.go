@@ -66,6 +66,28 @@
 // returns ErrNoSession rather than falling back to plaintext. Falling back
 // would emit unencrypted KCP segments on the wire — a silent downgrade we
 // MUST avoid.
+//
+// # Server-side per-addr session map (T3.5)
+//
+// The server has many concurrent clients and therefore no single bound
+// session — the client-side sessionBinding pattern does not apply. Instead,
+// the server-side secureConn keeps a per-addr session map: every time
+// ReadFrom successfully opens an AEAD frame from some src addr, it records
+// (addr → *session.Session) in the map. When KCP later calls WriteTo with
+// the same addr (to send the corresponding ACK / data segment back to that
+// client), WriteTo looks up the session in the map, stamps its ID and
+// NextSeq into the outgoing frame, and AEAD-seals.
+//
+// This relies on KCP's invariant that the server only writes back to addrs
+// it has heard from — which holds for KCP's flow because every server-side
+// PacketConn write is in response to an inbound segment KCP just read. The
+// HELLO/HELLO_ACK exchange uses the plaintext send path (not secureConn.
+// WriteTo), so the bootstrap "no map entry yet" case never reaches WriteTo.
+//
+// A misbehaving / racing caller that hits WriteTo before any inbound frame
+// from addr was processed still gets ErrNoSession; the map is the only safe
+// way to know which session's ID and counter to stamp, and inventing one
+// would emit a frame the client cannot decrypt.
 
 package syntfo
 
@@ -144,12 +166,16 @@ type secureConn struct {
 	// binding is the client-side SessionCookieProvider (or any
 	// sessionBinding) used by WriteTo to fetch the bound session for
 	// outbound AEAD wrapping. nil on the server side: the server stamps
-	// the inbound session's ID/cookie based on per-packet lookups, not
-	// from a global binding (server-side write wiring lands in T3.5; for
-	// T3.4 the server uses secureConn only for reads, and Write callers
-	// on the server side go through the handshake's ServerSender path
-	// which is plaintext-only).
+	// the inbound session's ID/cookie based on the per-addr map below
+	// (populated as ReadFrom successfully opens frames).
 	binding sessionBinding
+
+	// addrMu guards addrSessions. The map is hot on both the read path
+	// (insert on every accepted AEAD frame) and the write path (lookup on
+	// every server-side outbound segment), but the operations are short
+	// (single map lookup / assign) so a plain RWMutex is appropriate.
+	addrMu       sync.RWMutex
+	addrSessions map[string]*session.Session
 
 	closeOnce sync.Once
 	closed    chan struct{}
@@ -164,12 +190,13 @@ type secureConn struct {
 // canonical binding.
 func newSecureConn(under underlyingConn, mgr *session.Manager, counters *Counters, binding sessionBinding) *secureConn {
 	return &secureConn{
-		under:    under,
-		encKey:   mgr.EncKey(),
-		mgr:      mgr,
-		counters: counters,
-		binding:  binding,
-		closed:   make(chan struct{}),
+		under:        under,
+		encKey:       mgr.EncKey(),
+		mgr:          mgr,
+		counters:     counters,
+		binding:      binding,
+		addrSessions: make(map[string]*session.Session),
+		closed:       make(chan struct{}),
 	}
 }
 
@@ -196,18 +223,18 @@ func (s *secureConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 	default:
 	}
 
-	if s.binding == nil {
-		// Server-side secureConn does not have a single bound session.
-		// The current ctun architecture only writes outbound from KCP
-		// on the client side; if a future server-side write path lands
-		// (T3.5+) this branch will need to look up the destination's
-		// session and stamp its ID/cookie. For T3.4 we return a typed
-		// error rather than silently emitting plaintext — the brief is
-		// explicit that no plaintext fallback is permitted.
-		return 0, ErrNoSession
+	var sess *session.Session
+	if s.binding != nil {
+		// Client-side path: a SessionCookieProvider tracks the single
+		// bound session.
+		sess = s.binding.Bound()
+	} else {
+		// Server-side path (T3.5): look the destination's session up in
+		// the per-addr map populated by ReadFrom. Until the first inbound
+		// AEAD frame from addr has been processed there is no entry, in
+		// which case we return ErrNoSession rather than guessing.
+		sess = s.lookupAddrSession(addr)
 	}
-
-	sess := s.binding.Bound()
 	if sess == nil {
 		return 0, ErrNoSession
 	}
@@ -290,9 +317,19 @@ func (s *secureConn) ReadFrom(p []byte) (int, net.Addr, error) {
 		// Try AEAD path first.
 		opened, err := crypto.Open(s.encKey, raw)
 		if err == nil {
-			plaintext, ok := s.handleAEADFrame(opened)
+			plaintext, sess, ok := s.handleAEADFrame(opened)
 			if !ok {
 				continue
+			}
+			// Server-side per-addr binding (T3.5): record the
+			// (addr → session) mapping so a subsequent WriteTo to
+			// the same addr knows which session's ID and sequence
+			// counter to stamp. Client-side has its own binding and
+			// does not consult this map. Recording unconditionally
+			// is harmless on the client side (its WriteTo never
+			// reads the map).
+			if addr != nil {
+				s.rememberAddrSession(addr, sess)
 			}
 			copied := copy(p, plaintext)
 			return copied, addr, nil
@@ -329,9 +366,10 @@ func (s *secureConn) ReadFrom(p []byte) (int, net.Addr, error) {
 }
 
 // handleAEADFrame processes a successfully-opened AEAD payload. It returns
-// the inner plaintext payload (the KCP segment) and true on accept, or nil
-// and false on drop. Counters are incremented on drop.
-func (s *secureConn) handleAEADFrame(opened []byte) ([]byte, bool) {
+// the inner plaintext payload (the KCP segment), the resolved Session (so the
+// caller can register the addr → session mapping), and true on accept; nil
+// payload, nil session, and false on drop. Counters are incremented on drop.
+func (s *secureConn) handleAEADFrame(opened []byte) ([]byte, *session.Session, bool) {
 	msg, err := protocol.Unmarshal(opened)
 	if err != nil {
 		// The AEAD tag matched but the inner protocol frame is
@@ -340,7 +378,7 @@ func (s *secureConn) handleAEADFrame(opened []byte) ([]byte, bool) {
 		// bytes, so a mismatch here means we trusted a payload our
 		// peer hand-built). Treat as malformed.
 		s.counters.incMalformedFrame()
-		return nil, false
+		return nil, nil, false
 	}
 
 	// Look up the session by ID. After a successful Open we trust the
@@ -351,17 +389,45 @@ func (s *secureConn) handleAEADFrame(opened []byte) ([]byte, bool) {
 	sess := s.mgr.LookupSession(id)
 	if sess == nil {
 		s.counters.incUnknownSession()
-		return nil, false
+		return nil, nil, false
 	}
 
 	// Anti-replay: per-session sliding window over recently-observed
 	// sequence numbers. Duplicates and too-old sequence numbers drop.
 	if !sess.ReplayFilter().Check(msg.Sequence) {
 		s.counters.incReplay()
-		return nil, false
+		return nil, nil, false
 	}
 
-	return msg.Payload, true
+	return msg.Payload, sess, true
+}
+
+// rememberAddrSession records the (addr → session) mapping used by the
+// server-side WriteTo path. Called from ReadFrom after a successful AEAD
+// Open + session lookup + replay check. Re-binding the same addr (e.g. a
+// client that reconnected and was issued a new session) silently overwrites
+// the old mapping — the newer session is the one KCP will be replying to.
+func (s *secureConn) rememberAddrSession(addr net.Addr, sess *session.Session) {
+	key := addr.String()
+	s.addrMu.Lock()
+	if existing, ok := s.addrSessions[key]; !ok || existing != sess {
+		s.addrSessions[key] = sess
+	}
+	s.addrMu.Unlock()
+}
+
+// lookupAddrSession returns the session previously associated with addr via
+// rememberAddrSession, or nil if no such mapping exists. Used by the
+// server-side WriteTo path.
+func (s *secureConn) lookupAddrSession(addr net.Addr) *session.Session {
+	if addr == nil {
+		return nil
+	}
+	key := addr.String()
+	s.addrMu.RLock()
+	sess := s.addrSessions[key]
+	s.addrMu.RUnlock()
+	return sess
 }
 
 // LocalAddr implements net.PacketConn. Delegated to the underlying conn
