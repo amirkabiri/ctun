@@ -1,0 +1,29 @@
+# SYN-only feasibility fixture — local_flag: ["S"] only.
+# Mirrors server-pa.yaml but with the flag profile narrowed to a bare SYN so
+# we can probe whether paqet's flag-cycling code path is fully wired for the
+# SYN-only mode that Phase 1 builds on. T0.3 owns this file; T1.5 replaces it
+# with a SYN-TFO variant and T4.6 deletes it.
+#
+# Placeholders: see server-pa.yaml.
+role: "server"
+
+log:
+  level: "warn"
+
+listen:
+  addr: "127.0.0.1:{{.TunnelPort}}"
+
+network:
+  interface: "{{.Iface}}"
+  ipv4:
+    addr: "127.0.0.1:{{.TunnelPort}}"
+    router_mac: "{{.RouterMAC}}"
+  tcp:
+    local_flag: ["S"]
+
+transport:
+  protocol: "kcp"
+  conn: 1
+  kcp:
+    mode: "fast"
+    key: "{{.SharedKey}}"
