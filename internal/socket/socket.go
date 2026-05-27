@@ -151,3 +151,17 @@ func (c *PacketConn) SetDSCP(dscp int) error {
 func (c *PacketConn) SetClientTCPF(addr net.Addr, f []conf.TCPF) {
 	c.sendHandle.setClientTCPF(addr, f)
 }
+
+// SetSYNOptionsBuilder forwards to the underlying SendHandle. The SYN-TFO
+// transport calls this during its New() to install the option builder that
+// stamps the Kind=34 TFO option on every emitted SYN (T1.2).
+func (c *PacketConn) SetSYNOptionsBuilder(b SYNOptionsBuilder) {
+	c.sendHandle.SetSYNOptionsBuilder(b)
+}
+
+// SetSYNSeqDeriver forwards to the underlying SendHandle. See SendHandle's
+// SetSYNSeqDeriver — this is the route by which the syntfo transport
+// installs the T0.3 entropy fix.
+func (c *PacketConn) SetSYNSeqDeriver(d SYNSeqDeriver) {
+	c.sendHandle.SetSYNSeqDeriver(d)
+}

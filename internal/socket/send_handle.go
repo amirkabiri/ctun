@@ -23,6 +23,27 @@ type TCPF struct {
 	mu         sync.RWMutex
 }
 
+// SYNOptionsBuilder produces the TCP option list for an outgoing SYN. The
+// SYN-TFO transport (internal/transport/syntfo) installs one via
+// SetSYNOptionsBuilder so the option-set (in particular the Kind=34 TFO
+// option introduced in T1.2) lives in the transport, not in this low-level
+// pcap wrapper. tsVal is the timestamp value the caller wants stamped into
+// the Timestamps option.
+//
+// Keeping this as a function-typed hook — rather than importing the syntfo
+// package directly — preserves an acyclic dependency: socket -> {nothing in
+// internal/transport}, syntfo -> socket. If a future transport wants a
+// different option set it installs its own builder; the default behaviour
+// when no builder is installed is the pre-T1.2 paqet option set.
+type SYNOptionsBuilder func(tsVal uint32) []layers.TCPOption
+
+// SYNSeqDeriver returns the TCP sequence number for an outgoing SYN. T0.3
+// routed the seq-entropy fix to T1.2; we accept a pluggable derivation so
+// the transport that owns the wire format (syntfo today) can choose the
+// derivation that makes its packets dedup-resistant, while this package
+// stays a thin pcap wrapper with no semantic say in TCP sequencing.
+type SYNSeqDeriver func(timeBase, counter uint32) uint32
+
 type SendHandle struct {
 	handle      *pcap.Handle
 	srcIPv4     net.IP
@@ -38,6 +59,20 @@ type SendHandle struct {
 	ipv6Pool    sync.Pool
 	tcpPool     sync.Pool
 	bufPool     sync.Pool
+
+	// synOptionsBuilder, when non-nil, replaces the default SYN option list.
+	// Installed by internal/transport/syntfo at construction time so the TFO
+	// option (Kind=34, T1.2) can land on every SYN without socket importing
+	// syntfo (which would create a cycle). nil means "use the paqet-era
+	// default option set".
+	synOptionsBuilder SYNOptionsBuilder
+
+	// synSeqDeriver, when non-nil, replaces the default SYN sequence-number
+	// derivation. T0.3 found the default (`1 + counter & 0x7`) only emits 8
+	// distinct sequence numbers, which causes silent dedup drops in SYN-only
+	// mode; the syntfo transport installs a 32-bit-entropy deriver via this
+	// hook. nil keeps the legacy behaviour for transports that don't care.
+	synSeqDeriver SYNSeqDeriver
 }
 
 func NewSendHandle(cfg *conf.Network) (*SendHandle, error) {
@@ -135,16 +170,39 @@ func (h *SendHandle) buildTCPHeader(dstPort uint16, f conf.TCPF) *layers.TCP {
 	counter := atomic.AddUint32(&h.tsCounter, 1)
 	tsVal := h.time + (counter >> 3)
 	if f.SYN {
-		tcp.Options = []layers.TCPOption{
-			{OptionType: layers.TCPOptionKindMSS, OptionLength: 4, OptionData: []byte{0x05, 0xb4}},
-			{OptionType: layers.TCPOptionKindSACKPermitted, OptionLength: 2},
-			{OptionType: layers.TCPOptionKindTimestamps, OptionLength: 10, OptionData: make([]byte, 8)},
-			{OptionType: layers.TCPOptionKindNop},
-			{OptionType: layers.TCPOptionKindWindowScale, OptionLength: 3, OptionData: []byte{8}},
+		// Option set: prefer the transport-supplied builder (syntfo installs
+		// one carrying the TFO option, T1.2). Fall back to the legacy
+		// option set when no builder is installed so non-syntfo callers
+		// (tests, other transports) keep the pre-T1.2 behaviour.
+		if h.synOptionsBuilder != nil {
+			tcp.Options = h.synOptionsBuilder(tsVal)
+		} else {
+			tcp.Options = []layers.TCPOption{
+				{OptionType: layers.TCPOptionKindMSS, OptionLength: 4, OptionData: []byte{0x05, 0xb4}},
+				{OptionType: layers.TCPOptionKindSACKPermitted, OptionLength: 2},
+				{OptionType: layers.TCPOptionKindTimestamps, OptionLength: 10, OptionData: make([]byte, 8)},
+				{OptionType: layers.TCPOptionKindNop},
+				{OptionType: layers.TCPOptionKindWindowScale, OptionLength: 3, OptionData: []byte{8}},
+			}
+			binary.BigEndian.PutUint32(tcp.Options[2].OptionData[0:4], tsVal)
+			binary.BigEndian.PutUint32(tcp.Options[2].OptionData[4:8], 0)
 		}
-		binary.BigEndian.PutUint32(tcp.Options[2].OptionData[0:4], tsVal)
-		binary.BigEndian.PutUint32(tcp.Options[2].OptionData[4:8], 0)
-		tcp.Seq = 1 + (counter & 0x7)
+		// Sequence: T0.3 routed the seq-entropy fix to T1.2. The legacy
+		// formula `1 + (counter & 0x7)` produced only 8 distinct values,
+		// which causes silent dedup drops in SYN-only mode (paqet's normal
+		// PA flow never noticed because it had a proper full-entropy seq
+		// in the non-SYN branch). We are forging the SYN here — this is NOT
+		// the kernel's TCP stack picking an ISN, so we must supply the
+		// entropy explicitly. The syntfo transport (which owns the wire
+		// format) installs a derivation matching the non-SYN branch's
+		// `time + counter<<7` template, giving the full 32-bit range. A
+		// nil deriver keeps legacy behaviour for backward compatibility
+		// with non-syntfo callers.
+		if h.synSeqDeriver != nil {
+			tcp.Seq = h.synSeqDeriver(h.time, counter)
+		} else {
+			tcp.Seq = 1 + (counter & 0x7)
+		}
 		tcp.Ack = 0
 		if f.ACK {
 			tcp.Ack = tcp.Seq + 1
@@ -220,6 +278,29 @@ func (h *SendHandle) setClientTCPF(addr net.Addr, f []conf.TCPF) {
 	h.tcpF.mu.Lock()
 	h.tcpF.clientTCPF[hash.IPAddr(a.IP, uint16(a.Port))] = &iterator.Iterator[conf.TCPF]{Items: f}
 	h.tcpF.mu.Unlock()
+}
+
+// SetSYNOptionsBuilder installs the SYN-option builder used in the SYN branch
+// of buildTCPHeader. Callers (today: only the syntfo transport) wire this at
+// construction time; subsequent Writes pick up the new builder via the
+// SendHandle's pointer to it. Passing nil restores the default option set.
+//
+// Concurrency: this is intended to be called once during transport setup,
+// before any Write calls. It is safe to call concurrently with Write only
+// in the sense that the pointer assignment itself is word-aligned and
+// goroutines will observe either the old or new builder per call, never a
+// torn pointer. There is intentionally no mutex because the use case is
+// "install once at startup," not "swap mid-flight."
+func (h *SendHandle) SetSYNOptionsBuilder(b SYNOptionsBuilder) {
+	h.synOptionsBuilder = b
+}
+
+// SetSYNSeqDeriver installs the SYN sequence-number deriver. See the
+// SYNSeqDeriver doc and the comment in buildTCPHeader for why this is a
+// hook rather than a hardcoded derivation in this package. Same concurrency
+// caveats as SetSYNOptionsBuilder.
+func (h *SendHandle) SetSYNSeqDeriver(d SYNSeqDeriver) {
+	h.synSeqDeriver = d
 }
 
 func (h *SendHandle) Close() {
