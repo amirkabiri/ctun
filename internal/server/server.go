@@ -10,6 +10,7 @@ import (
 
 	"ctun/internal/conf"
 	"ctun/internal/flog"
+	"ctun/internal/session"
 	"ctun/internal/tnet"
 	"ctun/internal/tnet/kcp"
 	"ctun/internal/transport"
@@ -18,14 +19,16 @@ import (
 
 type Server struct {
 	cfg       *conf.Conf
+	mgr       *session.Manager
 	transport transport.Transport
 	syntfo    *syntfo.Transport // non-nil iff transport is the syn-tfo impl
 	wg        sync.WaitGroup
 }
 
-func New(cfg *conf.Conf) (*Server, error) {
+func New(cfg *conf.Conf, mgr *session.Manager) (*Server, error) {
 	s := &Server{
 		cfg: cfg,
+		mgr: mgr,
 	}
 
 	return s, nil
@@ -42,9 +45,16 @@ func (s *Server) Start() error {
 		cancel()
 	}()
 
+	// Plumb the session manager through ExtraParams (T1.1's transport-specific
+	// escape hatch). The syn-tfo transport recognises the key and wires the
+	// SessionCookieProvider; non-syn-tfo transports ignore it. Documented in
+	// docs/implementation-doc.md → T3.2 → "Where manager is plumbed".
 	tr, err := transport.New(s.cfg.TransportImpl, transport.Config{
 		Ctx:     ctx,
 		Network: &s.cfg.Network,
+		ExtraParams: map[string]any{
+			syntfo.ExtraParamSessionManager: s.mgr,
+		},
 	})
 	if err != nil {
 		return fmt.Errorf("could not create transport: %w", err)

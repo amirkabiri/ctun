@@ -27,9 +27,26 @@ import (
 	"github.com/gopacket/gopacket/layers"
 
 	"ctun/internal/conf"
+	"ctun/internal/session"
 	"ctun/internal/socket"
 	"ctun/internal/transport"
 )
+
+// ExtraParamCookieProvider is the transport.Config.ExtraParams key (T1.1's
+// escape hatch) used to inject a CookieProvider into New. The plumbing
+// choice — ExtraParams vs. adding a typed field to transport.Config — is
+// documented at the top of New's body; T3.2 uses ExtraParams to keep the
+// public Config schema unchanged.
+const ExtraParamCookieProvider = "syntfo.cookie_provider"
+
+// ExtraParamSessionManager is the transport.Config.ExtraParams key for
+// passing a *session.Manager. It is provided as a convenience when the
+// caller has a manager but has not pre-built a SessionCookieProvider —
+// New will wrap the manager with NewSessionCookieProvider on the caller's
+// behalf. If both keys are set, ExtraParamCookieProvider wins (the explicit
+// provider takes precedence) and the manager is held for future use
+// (validator wiring lands in T3.3).
+const ExtraParamSessionManager = "syntfo.session_manager"
 
 // Name is the registered identifier for this transport, matching the design
 // doc and the value of conf.Conf.TransportImpl when defaulted.
@@ -60,14 +77,33 @@ type Transport struct {
 	conn     *socket.PacketConn
 	cookies  CookieProvider
 	counters *Counters
+	// mgr is the session manager that backs the cookie provider's validator
+	// half. T3.2 stashes it here so T3.3 can hook ValidateCookie into
+	// gateOptions without another constructor-API change. It may be nil when
+	// no manager was supplied (tests, the legacy static-cookie path).
+	mgr *session.Manager
 }
 
 // New is the Factory registered under Name. It opens the underlying pcap-based
 // packet conn, installs the SYN-TFO option builder + the T0.3 seq-entropy
 // fix on the send path, and returns the wrapped transport.
 //
-// The CookieProvider used here is the static stub from cookie.go; T3.2 will
-// replace it by extending Config / wiring a session manager.
+// CookieProvider resolution (T3.2):
+//
+//  1. If cfg.ExtraParams[ExtraParamCookieProvider] is set and is a
+//     CookieProvider, use it directly.
+//  2. Else if cfg.ExtraParams[ExtraParamSessionManager] is set and is a
+//     *session.Manager, wrap it with NewSessionCookieProvider.
+//  3. Else fall back to the T1.2 static stub. This keeps existing tests and
+//     any caller that does not yet construct a session manager working
+//     unchanged.
+//
+// The ExtraParams escape hatch (defined in T1.1) is the smaller diff than
+// adding a typed field to the shared transport.Config — only this transport
+// understands the keys, so promoting them to the shared schema would force
+// every future transport to acknowledge them. Documented choice; see the
+// Configuration discussion in docs/implementation-doc.md → Appendix C
+// (entries from T1.1).
 func New(cfg transport.Config) (transport.Transport, error) {
 	if cfg.Network == nil {
 		return nil, fmt.Errorf("syntfo: Config.Network is required")
@@ -81,11 +117,18 @@ func New(cfg transport.Config) (transport.Transport, error) {
 		return nil, fmt.Errorf("syntfo: open packet conn: %w", err)
 	}
 
+	cookies, mgr, err := resolveCookieProvider(cfg.ExtraParams)
+	if err != nil {
+		pConn.Close()
+		return nil, err
+	}
+
 	t := &Transport{
 		cfg:      cfg.Network,
 		conn:     pConn,
-		cookies:  NewStaticCookieProvider(DefaultStaticCookie()),
+		cookies:  cookies,
 		counters: NewCounters(),
+		mgr:      mgr,
 	}
 
 	// Install the T1.2 SYN-option builder: every emitted SYN carries the
@@ -115,12 +158,31 @@ func New(cfg transport.Config) (transport.Transport, error) {
 // SetSYNGate. It returns true to accept a packet for the upper layer or
 // false to drop it; on drop it increments the appropriate counter.
 //
-// Cookie validation (the HMAC check against the session-bound provider) is
-// deferred to T3.2; T1.3 only enforces option *shape*. The decoded cookie
-// value is discarded here — see TODO below. Once T3.2 lands, gateOptions
-// will pass the cookie up to the session manager for HMAC validation; for
-// now it is decoded-but-unused so the hot-path call shape stays stable
-// across the T1.3 → T3.2 transition.
+// Cookie validation status (T3.2 — Option A from the task brief):
+//
+// The HMAC-over-SessionID validation step from design §8.4 is **NOT**
+// performed here yet. The reason is that the SessionID lives in the
+// protocol header (T3.1), which lives inside the AEAD ciphertext (T3.3+);
+// at T3.2 the AEAD layer has not been wired onto the outbound path so the
+// gate has no SessionID to look up. Inventing a cookie validator that
+// ignored the SessionID-in-header (Option B) would create the illusion of
+// authentication while accepting any cookie that ever matched any known
+// session — strictly worse than no check, because it would silently mask
+// the missing piece. T3.2 therefore stays in scope: option *shape* is
+// enforced (T1.3); the *cookie* contents are decoded-but-not-validated and
+// will be cross-checked against the post-AEAD SessionID once T3.3 lands.
+//
+// HELLO (zero-cookie) handling has the same caveat: design §8.4 says a
+// zero cookie should be accepted only when the decrypted frame's Flags ==
+// FlagHello. We cannot enforce that until AEAD reaches this gate. The
+// SessionCookieProvider on the send side already emits the zero sentinel
+// before Bind is called, so the wire format will be correct from day one
+// once T3.3 turns the validator on.
+//
+// TODO(T3.3): after AEAD is wired onto the recv path, decode the protocol
+// header here, route the cookie through t.mgr.ValidateCookie(sessionID,
+// cookie), and bump the BadCookie counter on reject. The all-zero cookie
+// path should only accept frames whose decrypted Flags equals FlagHello.
 //
 // Exposed as a method (rather than an anonymous closure inside New) so
 // tests can drive the gate directly without spinning up a pcap handle.
@@ -130,9 +192,9 @@ func (t *Transport) gateOptions(options []layers.TCPOption) bool {
 	_, status := classifyTFO(options)
 	switch status {
 	case tfoStatusOK:
-		// TODO(T3.2): pass the cookie value up to the session manager for
-		// the HMAC validation step. Today we discard it because no
-		// consumer exists.
+		// See the long-form comment above for why the cookie value is
+		// discarded here in T3.2. The wiring lands in T3.3 once AEAD
+		// decryption gives us the SessionID to look up.
 		return true
 	case tfoStatusMissing:
 		t.counters.incNoTFO()
@@ -235,6 +297,47 @@ func (t *Transport) LocalAddr() netip.AddrPort {
 // Close implements transport.Transport.
 func (t *Transport) Close() error {
 	return t.conn.Close()
+}
+
+// SessionManager returns the *session.Manager wired in via ExtraParams (or
+// nil if none was supplied). T3.3 uses this accessor to reach the manager
+// when promoting an inbound HELLO into a registered session — T3.2 does not
+// call it itself but exposes it now so the wiring is reachable.
+func (t *Transport) SessionManager() *session.Manager {
+	return t.mgr
+}
+
+// resolveCookieProvider implements New's three-step resolution order for the
+// CookieProvider (see New's body for the documented order). Extracted into a
+// helper so New itself stays readable; the unit tests in cookie_test.go and
+// syntfo_test.go exercise both ExtraParams keys against it via New.
+//
+// Type assertions are intentionally strict — if a caller passes an
+// ExtraParam under one of the recognised keys but with the wrong concrete
+// type, that is a programming error and we return it rather than silently
+// falling through to the static stub. A silent fallback would hide
+// misconfiguration (a non-syntfo deployment looking like it had cookies
+// wired up when it actually didn't).
+func resolveCookieProvider(params map[string]any) (CookieProvider, *session.Manager, error) {
+	var mgr *session.Manager
+	if v, ok := params[ExtraParamSessionManager]; ok {
+		m, ok := v.(*session.Manager)
+		if !ok {
+			return nil, nil, fmt.Errorf("syntfo: ExtraParams[%q] is not *session.Manager (got %T)", ExtraParamSessionManager, v)
+		}
+		mgr = m
+	}
+	if v, ok := params[ExtraParamCookieProvider]; ok {
+		p, ok := v.(CookieProvider)
+		if !ok {
+			return nil, mgr, fmt.Errorf("syntfo: ExtraParams[%q] is not syntfo.CookieProvider (got %T)", ExtraParamCookieProvider, v)
+		}
+		return p, mgr, nil
+	}
+	if mgr != nil {
+		return NewSessionCookieProvider(mgr), mgr, nil
+	}
+	return NewStaticCookieProvider(DefaultStaticCookie()), nil, nil
 }
 
 // addrPortToUDPAddr translates a netip.AddrPort into the *net.UDPAddr that the

@@ -16,7 +16,12 @@
 
 package syntfo
 
-import "context"
+import (
+	"context"
+	"sync"
+
+	"ctun/internal/session"
+)
 
 // CookieSize is the on-wire size of the TFO cookie carried inside the TCP
 // option payload. RFC 7413 specifies an 8-byte cookie for ctun's profile.
@@ -81,4 +86,95 @@ var defaultStaticCookieBytes = [CookieSize]byte{
 // the value the send path will emit.
 func DefaultStaticCookie() [CookieSize]byte {
 	return defaultStaticCookieBytes
+}
+
+// SessionCookieProvider is the real CookieProvider that replaces the T1.2
+// static stub for any deployment that has been handed a *session.Manager.
+// It stamps the bound session's cached cookie onto every outgoing SYN.
+//
+// # Pre-handshake (HELLO) semantics
+//
+// Until a session is bound (server-issued via HELLO_ACK, client-recorded via
+// session.Manager.BindSession), Cookie() returns the all-zero sentinel that
+// design-doc §8.4 reserves for HELLO frames. The server's recv-path gate
+// treats an all-zero cookie as "candidate handshake — try to decrypt as
+// HELLO"; see the TODO(T3.3) in syntfo.go's gateOptions for the rule the
+// recv side will enforce once the AEAD layer reaches the gate. Today the
+// gate still passes any well-formed Kind=34 option through unchanged
+// (Option A from the T3.2 brief — strictly in-scope and avoids faking a
+// validation step that depends on a not-yet-wired AEAD layer).
+//
+// # Concurrency
+//
+// Bind / Bound are guarded by a small RWMutex. Cookie() takes only the read
+// lock and falls through to the session's cached cookie value (which is
+// itself immutable after construction), so the hot path is cheap. A
+// concurrent Bind that promotes the provider from "unbound" to "bound" is
+// linearizable with concurrent Cookie() calls: any Cookie() that runs after
+// Bind returns will see the bound session.
+//
+// # Server vs client usage
+//
+// On the server side the per-session cookie is stamped onto outbound
+// SYN-ACK / server-to-client frames; on the client side it is stamped onto
+// the post-handshake client-to-server frames. Both sides construct the
+// provider via NewSessionCookieProvider and rely on a downstream call to
+// Bind once the session ID is known. Until that Bind happens the provider
+// emits the zero cookie, which is the design-doc-mandated HELLO sentinel.
+type SessionCookieProvider struct {
+	mgr *session.Manager
+
+	mu      sync.RWMutex
+	session *session.Session
+}
+
+// NewSessionCookieProvider builds a SessionCookieProvider backed by mgr. The
+// returned provider starts unbound — Cookie() returns the all-zero HELLO
+// sentinel until Bind is called.
+//
+// mgr is retained but not consulted by Cookie() on the hot path: once a
+// Session is bound, Cookie() returns the session's cached bytes directly.
+// The manager reference is kept so future helpers (e.g. a Refresh() that
+// re-binds against the manager's current session table) can be added
+// without changing the constructor signature.
+func NewSessionCookieProvider(mgr *session.Manager) *SessionCookieProvider {
+	return &SessionCookieProvider{mgr: mgr}
+}
+
+// Bind records s as the provider's bound session. After Bind returns,
+// Cookie() returns s.Cookie() on every call. Passing nil unbinds (Cookie()
+// reverts to the zero sentinel) — this is convenient for tests but is not
+// used by the production wiring.
+//
+// Idempotent: Bind(s) twice in a row is a no-op on the second call. Re-bind
+// to a different session replaces the previous binding.
+func (p *SessionCookieProvider) Bind(s *session.Session) {
+	p.mu.Lock()
+	p.session = s
+	p.mu.Unlock()
+}
+
+// Bound returns the currently bound session, or nil if the provider is still
+// in the pre-handshake state. Exported for tests and for future T3.3 wiring
+// that needs to inspect the binding to populate the protocol.Message
+// SessionID field.
+func (p *SessionCookieProvider) Bound() *session.Session {
+	p.mu.RLock()
+	s := p.session
+	p.mu.RUnlock()
+	return s
+}
+
+// Cookie returns the bound session's cached cookie, or the all-zero HELLO
+// sentinel when no session has been bound yet. The ctx argument is reserved
+// for future implementations that may need to honour cancellation; this
+// provider never blocks.
+func (p *SessionCookieProvider) Cookie(_ context.Context) [CookieSize]byte {
+	p.mu.RLock()
+	s := p.session
+	p.mu.RUnlock()
+	if s == nil {
+		return [CookieSize]byte{}
+	}
+	return s.Cookie()
 }

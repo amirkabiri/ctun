@@ -24,7 +24,8 @@ func startClient(cfg *conf.Conf) {
 		cancel()
 	}()
 
-	client, err := client.New(cfg)
+	mgr := newSessionManager(cfg)
+	client, err := client.New(cfg, mgr)
 	if err != nil {
 		flog.Fatalf("Failed to initialize client: %v", err)
 	}

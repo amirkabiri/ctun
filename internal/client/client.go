@@ -5,20 +5,23 @@ import (
 	"ctun/internal/conf"
 	"ctun/internal/flog"
 	"ctun/internal/pkg/iterator"
+	"ctun/internal/session"
 	"ctun/internal/tnet"
 	"sync"
 )
 
 type Client struct {
 	cfg     *conf.Conf
+	mgr     *session.Manager
 	iter    *iterator.Iterator[*timedConn]
 	udpPool *udpPool
 	mu      sync.Mutex
 }
 
-func New(cfg *conf.Conf) (*Client, error) {
+func New(cfg *conf.Conf, mgr *session.Manager) (*Client, error) {
 	c := &Client{
 		cfg:     cfg,
+		mgr:     mgr,
 		iter:    &iterator.Iterator[*timedConn]{},
 		udpPool: &udpPool{strms: make(map[uint64]tnet.Strm)},
 	}
@@ -27,7 +30,7 @@ func New(cfg *conf.Conf) (*Client, error) {
 
 func (c *Client) Start(ctx context.Context) error {
 	for i := range c.cfg.Transport.Conn {
-		tc, err := newTimedConn(ctx, c.cfg)
+		tc, err := newTimedConn(ctx, c.cfg, c.mgr)
 		if err != nil {
 			flog.Errorf("failed to create connection %d: %v", i+1, err)
 			return err

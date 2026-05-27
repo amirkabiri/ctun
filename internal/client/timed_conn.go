@@ -4,24 +4,26 @@ import (
 	"context"
 	"ctun/internal/conf"
 	"ctun/internal/protocol"
+	"ctun/internal/session"
 	"ctun/internal/tnet"
 	"ctun/internal/tnet/kcp"
 	"ctun/internal/transport"
-	_ "ctun/internal/transport/syntfo" // register the "syn-tfo" transport
+	"ctun/internal/transport/syntfo"
 	"fmt"
 	"time"
 )
 
 type timedConn struct {
 	cfg    *conf.Conf
+	mgr    *session.Manager
 	conn   tnet.Conn
 	expire time.Time
 	ctx    context.Context
 }
 
-func newTimedConn(ctx context.Context, cfg *conf.Conf) (*timedConn, error) {
+func newTimedConn(ctx context.Context, cfg *conf.Conf, mgr *session.Manager) (*timedConn, error) {
 	var err error
-	tc := timedConn{cfg: cfg, ctx: ctx}
+	tc := timedConn{cfg: cfg, mgr: mgr, ctx: ctx}
 	tc.conn, err = tc.createConn()
 	if err != nil {
 		return nil, err
@@ -32,9 +34,17 @@ func newTimedConn(ctx context.Context, cfg *conf.Conf) (*timedConn, error) {
 
 func (tc *timedConn) createConn() (tnet.Conn, error) {
 	netCfg := tc.cfg.Network
+	// Plumb the session manager through ExtraParams (T1.1's transport-specific
+	// escape hatch). The syn-tfo transport recognises the key and wires the
+	// SessionCookieProvider so post-handshake packets stamp the right TFO
+	// cookie; pre-handshake (HELLO) frames still get the zero sentinel until
+	// the client binds the session ID returned by HELLO_ACK in T3.3.
 	tr, err := transport.New(tc.cfg.TransportImpl, transport.Config{
 		Ctx:     tc.ctx,
 		Network: &netCfg,
+		ExtraParams: map[string]any{
+			syntfo.ExtraParamSessionManager: tc.mgr,
+		},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("could not create transport: %w", err)
