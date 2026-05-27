@@ -1,0 +1,19 @@
+ctun
+=====
+
+This product is a fork of paqet (https://github.com/hanselime/paqet),
+licensed under the MIT License. See LICENSE for the full text.
+
+Fork base
+---------
+Upstream repository: https://github.com/hanselime/paqet
+Upstream commit SHA: d6d72e1ff13c5ecc5a4a6d358844248d6f8bf8fa
+Fork date:           2026-05-27
+
+Substantial portions of this software are derived from paqet. Original
+copyright notices have been preserved in LICENSE.
+
+Modifications by the ctun authors include (and will include): a TCP Fast
+Open option on every emitted SYN, a pluggable Transport interface, a
+ChaCha20-Poly1305 + HKDF + anti-replay security stack, automatic firewall
+management, and a fixed binary wire format replacing paqet's encoding/gob.
