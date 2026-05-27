@@ -1,0 +1,36 @@
+# Phase-1 SYN-TFO fixture (server) — explicit `transport_impl: "syn-tfo"`.
+#
+# Derived from server-s.yaml (the SYN-only feasibility fixture T0.3 used). The
+# only material difference is the explicit `transport_impl` selector: the
+# config defaulter (internal/conf/conf.go) already resolves an empty value to
+# "syn-tfo", but T1.5's smoke test is the first integration check that the
+# Phase-1 transport — with the TFO option on every SYN and the receive-side
+# Kind=34 gate — is what's actually carrying traffic. Pinning the selector in
+# the YAML makes that intent obvious to anyone skimming the fixture and locks
+# the test against a future default flip.
+#
+# Placeholders: see server-pa.yaml.
+role: "server"
+
+log:
+  level: "warn"
+
+transport_impl: "syn-tfo"
+
+listen:
+  addr: "127.0.0.1:{{.TunnelPort}}"
+
+network:
+  interface: "{{.Iface}}"
+  ipv4:
+    addr: "127.0.0.1:{{.TunnelPort}}"
+    router_mac: "{{.RouterMAC}}"
+  tcp:
+    local_flag: ["S"]
+
+transport:
+  protocol: "kcp"
+  conn: 1
+  kcp:
+    mode: "fast"
+    key: "{{.SharedKey}}"

@@ -26,11 +26,17 @@ go test ./test/integration/ -v
 # Full run, macOS / Linux:
 sudo go test ./test/integration/ -v
 
-# Just the baseline:
+# SYN-TFO end-to-end (the canonical Phase-1 integration test):
+sudo go test ./test/integration/ -run Smoke_SynTfo -v
+
+# Just the baseline (quarantined — SKIPs immediately):
 sudo go test ./test/integration/ -run Smoke_PaqetBaseline -v
 
+# Just the SYN-only (quarantined — SKIPs immediately):
+sudo go test ./test/integration/ -run Smoke_SynOnly -v
+
 # A single sub-iteration:
-sudo go test ./test/integration/ -run 'Smoke_PaqetBaseline/first-run' -v
+sudo go test ./test/integration/ -run 'Smoke_SynTfo/first-run' -v
 ```
 
 The suite is also skipped under `-short`, so plain `go test -short ./...` from
@@ -42,14 +48,29 @@ go test -short ./...
 
 ## What the suite covers today
 
-- `Smoke_PaqetBaseline` — boots the unmodified-default ctun server + client
-  (paqet's `local_flag: ["PA"]` flag profile) on loopback, drives an HTTP GET
-  through the SOCKS5 listener, and asserts the body. Runs the full
-  boot/round-trip/teardown cycle **twice** in a single `go test` invocation to
-  prove that ports, pcap handles, and child processes don't leak across runs.
-  This test is a Phase 0 baseline — T1.5 supersedes it with a SYN-only variant
-  and T4.6 deletes it. Do not extend it with feature coverage; add new tests
-  alongside instead.
+- `Smoke_SynTfo` — the canonical Phase-1 integration test. Boots the ctun
+  server + client with `transport_impl: "syn-tfo"` on loopback, drives an
+  HTTP GET through the SOCKS5 listener, and asserts both (a) the expected
+  response body and (b) that at least one captured SYN packet on the tunnel
+  port carries a TCP option with Kind=34 and OptionLength=10 — the on-wire
+  signature of the syntfo transport's TFO option. Runs `first-run` and
+  `second-run` in a single `go test` invocation so teardown leaks surface on
+  the second iteration. T4.5's CI matrix is expected to wire this test in as
+  the Phase-1 integration gate.
+
+## Quarantined (skipped)
+
+These tests are kept on disk for reference until T4.6 deletes them. Each one
+unconditionally calls `t.Skip("superseded by Test_Smoke_SynTfo; will be
+deleted in T4.6")` at the top of its `Test_Smoke_*` function, so the suite
+still compiles and lists them — they simply report `SKIP` immediately.
+
+- `Smoke_PaqetBaseline` — Phase 0 baseline with `local_flag: ["PA"]` (paqet
+  defaults). Superseded by `Smoke_SynTfo`; T4.6 deletes the file and its
+  fixtures (`fixtures/server-pa.yaml`, `fixtures/client-pa.yaml`).
+- `Smoke_SynOnly` — T0.3 feasibility probe with `local_flag: ["S"]`.
+  Superseded by `Smoke_SynTfo`; T4.6 deletes the file and its fixtures
+  (`fixtures/server-s.yaml`, `fixtures/client-s.yaml`).
 
 ## Configuration knobs
 

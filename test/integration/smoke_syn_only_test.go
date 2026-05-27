@@ -43,6 +43,7 @@ import (
 //
 //	sudo go test ./test/integration/ -run 'Smoke_SynOnly' -v
 func Test_Smoke_SynOnly(t *testing.T) {
+	t.Skip("superseded by Test_Smoke_SynTfo; will be deleted in T4.6")
 	skipUnlessRunnable(t)
 
 	bin := buildCtunBinary(t)
