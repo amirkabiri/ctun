@@ -10,7 +10,9 @@
 //   - Linux  (iptables): NOTRACK in raw/PREROUTING & raw/OUTPUT so conntrack
 //     ignores the synthetic flow; mangle/OUTPUT drops
 //     outbound RSTs on the tunnel port (server-only).
-//   - macOS  (pf):       installed by T4.2 — stubbed in this task.
+//   - macOS  (pf):       a named anchor `ctun.<port>` loaded with `pfctl -f`;
+//     server-side anchor `block drop`s tunnel-port traffic
+//     so the kernel cannot emit interfering responses.
 //   - Windows (netsh):   installed by T4.3 — stubbed in this task.
 //
 // The interface and the cleanup helper live in this file so callers compile
