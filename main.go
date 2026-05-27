@@ -6,6 +6,7 @@ import (
 	"ctun/cmd/ping"
 	"ctun/cmd/run"
 	"ctun/cmd/secret"
+	"ctun/cmd/transports"
 	"ctun/cmd/version"
 	"ctun/internal/flog"
 	"os"
@@ -26,6 +27,7 @@ func main() {
 	rootCmd.AddCommand(ping.Cmd)
 	rootCmd.AddCommand(secret.Cmd)
 	rootCmd.AddCommand(iface.Cmd)
+	rootCmd.AddCommand(transports.Cmd)
 	rootCmd.AddCommand(version.Cmd)
 
 	if err := rootCmd.Execute(); err != nil {
