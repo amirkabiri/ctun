@@ -1,6 +1,7 @@
 package run
 
 import (
+	"context"
 	"ctun/internal/conf"
 	"ctun/internal/crypto"
 	"ctun/internal/flog"
@@ -11,15 +12,31 @@ import (
 func startServer(cfg *conf.Conf) {
 	flog.Infof("Starting server...")
 
-	mgr := newSessionManager(cfg)
+	// Firewall rules must be in place before the server starts injecting
+	// synthetic packets via pcap; otherwise the host kernel will RST the
+	// inbound SYNs that don't match any listening socket. T4.4 wires
+	// setupFirewall (cmd/run/firewall_setup.go) here; cleanup is deferred
+	// via runWithFirewall so SIGINT/SIGTERM (handled inside server.Start)
+	// and panic both trigger rule removal.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	server, err := server.New(cfg, mgr)
+	cleanup, err := setupFirewall(ctx, cfg, true /* isServer */)
 	if err != nil {
-		flog.Fatalf("Failed to initialize server: %v", err)
+		flog.Fatalf("Failed to set up firewall: %v", err)
 	}
-	if err := server.Start(); err != nil {
-		flog.Fatalf("Server encountered an error: %v", err)
-	}
+
+	runWithFirewall(cleanup, func() {
+		mgr := newSessionManager(cfg)
+
+		srv, err := server.New(cfg, mgr)
+		if err != nil {
+			flog.Fatalf("Failed to initialize server: %v", err)
+		}
+		if err := srv.Start(); err != nil {
+			flog.Fatalf("Server encountered an error: %v", err)
+		}
+	})
 }
 
 // newSessionManager constructs the process's session.Manager from the PSK
