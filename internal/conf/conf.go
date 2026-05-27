@@ -20,13 +20,22 @@ type Conf struct {
 	// The naming collision with the older `transport:` block is intentional:
 	// `transport:` stays a block for backwards compatibility, and
 	// `transport_impl:` is the new top-level selector.
-	TransportImpl string    `yaml:"transport_impl"`
-	Listen        Server    `yaml:"listen"`
-	SOCKS5        []SOCKS5  `yaml:"socks5"`
-	Forward       []Forward `yaml:"forward"`
-	Network       Network   `yaml:"network"`
-	Server        Server    `yaml:"server"`
-	Transport     Transport `yaml:"transport"`
+	TransportImpl string `yaml:"transport_impl"`
+	// Cipher selects the outer AEAD primitive applied to whole frames
+	// before they hit the transport. Accepted values: "" / "none" (no
+	// outer AEAD — legacy paqet behaviour), and "chacha20poly1305".
+	// T2.2 introduces this primitive but T3.x is what actually applies
+	// it on the wire; selecting "chacha20poly1305" today is a no-op
+	// beyond the validator accepting it. See internal/conf/cipher.go
+	// for the rationale (this field is distinct from `transport.kcp.block`
+	// which routes to kcp-go's per-segment BlockCrypt layer).
+	Cipher    string    `yaml:"cipher"`
+	Listen    Server    `yaml:"listen"`
+	SOCKS5    []SOCKS5  `yaml:"socks5"`
+	Forward   []Forward `yaml:"forward"`
+	Network   Network   `yaml:"network"`
+	Server    Server    `yaml:"server"`
+	Transport Transport `yaml:"transport"`
 }
 
 func LoadFromFile(path string) (*Conf, error) {
@@ -74,12 +83,27 @@ func (c *Conf) setDefaults() {
 		// internal/conf via internal/socket).
 		c.TransportImpl = "syn-tfo"
 	}
+	// Cipher defaults to "" which the AEAD accessor maps to (CipherNone,
+	// false). We intentionally do NOT canonicalise to "none" here — keeping
+	// the zero-value empty string means YAML fixtures predating this field
+	// continue to round-trip without spurious diffs.
 }
 
 func (c *Conf) validate() error {
 	var allErrors []error
 
 	allErrors = append(allErrors, c.Log.validate()...)
+
+	// Cipher: accept "" / "none" / "chacha20poly1305"; anything else is a
+	// user error and rejected up front with the list of valid values so
+	// the operator can fix the YAML without spelunking.
+	switch c.Cipher {
+	case "", "none", "chacha20poly1305":
+		// ok
+	default:
+		allErrors = append(allErrors, fmt.Errorf("cipher %q is not supported; valid values are: \"\" (default), %q, %q", c.Cipher, "none", "chacha20poly1305"))
+	}
+
 	if c.Role == "client" && len(c.SOCKS5) == 0 && len(c.Forward) == 0 {
 		flog.Warnf("warning: client mode enabled but no SOCKS5 or forward configurations found")
 	}
