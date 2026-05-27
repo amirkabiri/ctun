@@ -2,8 +2,8 @@ package kcp
 
 import (
 	"ctun/internal/conf"
-	"ctun/internal/socket"
 	"ctun/internal/tnet"
+	"ctun/internal/transport"
 	"net"
 
 	"github.com/xtaci/kcp-go/v5"
@@ -11,18 +11,25 @@ import (
 )
 
 type Listener struct {
-	packetConn *socket.PacketConn
-	cfg        *conf.KCP
-	listener   *kcp.Listener
+	transport transport.Transport
+	cfg       *conf.KCP
+	listener  *kcp.Listener
 }
 
-func Listen(cfg *conf.KCP, pConn *socket.PacketConn) (tnet.Listener, error) {
+// Listen accepts KCP traffic on the supplied transport. Like Dial, this
+// requires the transport to expose a net.PacketConn via
+// transport.PacketConnProvider.
+func Listen(cfg *conf.KCP, tr transport.Transport) (tnet.Listener, error) {
+	pConn, err := packetConnOf(tr)
+	if err != nil {
+		return nil, err
+	}
 	l, err := kcp.ServeConn(cfg.Block, cfg.Dshard, cfg.Pshard, pConn)
 	if err != nil {
 		return nil, err
 	}
 
-	return &Listener{packetConn: pConn, cfg: cfg, listener: l}, nil
+	return &Listener{transport: tr, cfg: cfg, listener: l}, nil
 }
 
 func (l *Listener) Accept() (tnet.Conn, error) {
@@ -42,8 +49,8 @@ func (l *Listener) Close() error {
 	if l.listener != nil {
 		l.listener.Close()
 	}
-	if l.packetConn != nil {
-		l.packetConn.Close()
+	if l.transport != nil {
+		l.transport.Close()
 	}
 	return nil
 }

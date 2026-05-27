@@ -13,7 +13,8 @@ import (
 	"time"
 
 	"ctun/internal/conf"
-	"ctun/internal/socket"
+	"ctun/internal/transport"
+	_ "ctun/internal/transport/syntfo" // register the "syn-tfo" transport
 
 	"github.com/spf13/cobra"
 )
@@ -48,11 +49,26 @@ var Cmd = &cobra.Command{
 		defer cancel()
 
 		netCfg := cfg.Network
-		packetConn, err := socket.New(ctx, &netCfg)
+		tr, err := transport.New(cfg.TransportImpl, transport.Config{
+			Ctx:     ctx,
+			Network: &netCfg,
+		})
 		if err != nil {
-			log.Fatalf("Failed to create raw socket: %v", err)
+			log.Fatalf("Failed to create transport: %v", err)
 		}
-		defer packetConn.Close()
+		defer tr.Close()
+
+		// The dump command predates the Transport interface and uses
+		// SetReadDeadline to drive a poll loop. That method lives on
+		// net.PacketConn, not on the Transport contract, so we pull it via
+		// the PacketConnProvider capability. A transport without that
+		// capability simply can't drive `dump` — log loudly rather than
+		// silently mis-behave.
+		pcProvider, ok := tr.(transport.PacketConnProvider)
+		if !ok {
+			log.Fatalf("transport %T does not provide a net.PacketConn; `dump` requires it", tr)
+		}
+		packetConn := pcProvider.PacketConn()
 
 		log.Printf("listening for packets on :%d, (Press Ctrl+C to exit)", cfg.Listen.Addr.Port)
 

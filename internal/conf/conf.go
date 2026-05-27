@@ -11,14 +11,22 @@ import (
 )
 
 type Conf struct {
-	Role      string    `yaml:"role"`
-	Log       Log       `yaml:"log"`
-	Listen    Server    `yaml:"listen"`
-	SOCKS5    []SOCKS5  `yaml:"socks5"`
-	Forward   []Forward `yaml:"forward"`
-	Network   Network   `yaml:"network"`
-	Server    Server    `yaml:"server"`
-	Transport Transport `yaml:"transport"`
+	Role string `yaml:"role"`
+	Log  Log    `yaml:"log"`
+	// TransportImpl selects which transport.Transport implementation handles
+	// raw packet I/O. The existing `transport:` block (Protocol, Conn, KCP,
+	// ...) configures the wire-protocol-internal layers; this sibling key
+	// chooses the registered Transport by name. Empty defaults to "syn-tfo".
+	// The naming collision with the older `transport:` block is intentional:
+	// `transport:` stays a block for backwards compatibility, and
+	// `transport_impl:` is the new top-level selector.
+	TransportImpl string    `yaml:"transport_impl"`
+	Listen        Server    `yaml:"listen"`
+	SOCKS5        []SOCKS5  `yaml:"socks5"`
+	Forward       []Forward `yaml:"forward"`
+	Network       Network   `yaml:"network"`
+	Server        Server    `yaml:"server"`
+	Transport     Transport `yaml:"transport"`
 }
 
 func LoadFromFile(path string) (*Conf, error) {
@@ -58,6 +66,14 @@ func (c *Conf) setDefaults() {
 	c.Network.setDefaults(c.Role)
 	c.Server.setDefaults()
 	c.Transport.setDefaults(c.Role)
+	if c.TransportImpl == "" {
+		// "syn-tfo" matches syntfo.Name and is registered via the syntfo
+		// package's init(); we deliberately use a string literal here to
+		// avoid pulling internal/transport/syntfo into internal/conf (which
+		// would create a build-tag-free import cycle: syntfo imports
+		// internal/conf via internal/socket).
+		c.TransportImpl = "syn-tfo"
+	}
 }
 
 func (c *Conf) validate() error {

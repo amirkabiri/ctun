@@ -2,8 +2,8 @@ package kcp
 
 import (
 	"ctun/internal/protocol"
-	"ctun/internal/socket"
 	"ctun/internal/tnet"
+	"ctun/internal/transport"
 	"fmt"
 	"net"
 	"time"
@@ -13,7 +13,7 @@ import (
 )
 
 type Conn struct {
-	PacketConn *socket.PacketConn
+	Transport  transport.Transport
 	UDPSession *kcp.UDPSession
 	Session    *smux.Session
 }
@@ -65,8 +65,8 @@ func (c *Conn) Close() error {
 	if c.Session != nil {
 		c.Session.Close()
 	}
-	if c.PacketConn != nil {
-		c.PacketConn.Close()
+	if c.Transport != nil {
+		c.Transport.Close()
 	}
 	return err
 }

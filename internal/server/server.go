@@ -10,15 +10,17 @@ import (
 
 	"ctun/internal/conf"
 	"ctun/internal/flog"
-	"ctun/internal/socket"
 	"ctun/internal/tnet"
 	"ctun/internal/tnet/kcp"
+	"ctun/internal/transport"
+	"ctun/internal/transport/syntfo"
 )
 
 type Server struct {
-	cfg   *conf.Conf
-	pConn *socket.PacketConn
-	wg    sync.WaitGroup
+	cfg       *conf.Conf
+	transport transport.Transport
+	syntfo    *syntfo.Transport // non-nil iff transport is the syn-tfo impl
+	wg        sync.WaitGroup
 }
 
 func New(cfg *conf.Conf) (*Server, error) {
@@ -40,13 +42,23 @@ func (s *Server) Start() error {
 		cancel()
 	}()
 
-	pConn, err := socket.New(ctx, &s.cfg.Network)
+	tr, err := transport.New(s.cfg.TransportImpl, transport.Config{
+		Ctx:     ctx,
+		Network: &s.cfg.Network,
+	})
 	if err != nil {
-		return fmt.Errorf("could not create raw packet conn: %w", err)
+		return fmt.Errorf("could not create transport: %w", err)
 	}
-	s.pConn = pConn
+	s.transport = tr
+	// Preserve the syntfo-specific handle so the existing TCP-flag plumbing
+	// in handleStrm continues to work. When more transports land (T6.x), this
+	// surface will need to be generalised — until then, it is the simplest
+	// path to a zero-behaviour-change refactor.
+	if st, ok := tr.(*syntfo.Transport); ok {
+		s.syntfo = st
+	}
 
-	listener, err := kcp.Listen(s.cfg.Transport.KCP, pConn)
+	listener, err := kcp.Listen(s.cfg.Transport.KCP, tr)
 	if err != nil {
 		return fmt.Errorf("could not start KCP listener: %w", err)
 	}

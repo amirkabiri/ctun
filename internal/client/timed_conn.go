@@ -4,9 +4,10 @@ import (
 	"context"
 	"ctun/internal/conf"
 	"ctun/internal/protocol"
-	"ctun/internal/socket"
 	"ctun/internal/tnet"
 	"ctun/internal/tnet/kcp"
+	"ctun/internal/transport"
+	_ "ctun/internal/transport/syntfo" // register the "syn-tfo" transport
 	"fmt"
 	"time"
 )
@@ -31,13 +32,20 @@ func newTimedConn(ctx context.Context, cfg *conf.Conf) (*timedConn, error) {
 
 func (tc *timedConn) createConn() (tnet.Conn, error) {
 	netCfg := tc.cfg.Network
-	pConn, err := socket.New(tc.ctx, &netCfg)
+	tr, err := transport.New(tc.cfg.TransportImpl, transport.Config{
+		Ctx:     tc.ctx,
+		Network: &netCfg,
+	})
 	if err != nil {
-		return nil, fmt.Errorf("could not create packet conn: %w", err)
+		return nil, fmt.Errorf("could not create transport: %w", err)
 	}
 
-	conn, err := kcp.Dial(tc.cfg.Server.Addr, tc.cfg.Transport.KCP, pConn)
+	conn, err := kcp.Dial(tc.cfg.Server.Addr, tc.cfg.Transport.KCP, tr)
 	if err != nil {
+		// Releasing the transport here mirrors the previous behaviour where
+		// kcp.Dial's failure left the packet conn owned by us; close it so
+		// we don't leak the pcap handle.
+		tr.Close()
 		return nil, err
 	}
 	err = tc.sendTCPF(conn)

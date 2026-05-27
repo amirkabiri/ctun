@@ -45,8 +45,13 @@ func (s *Server) handleStrm(ctx context.Context, strm tnet.Strm) error {
 	case protocol.PPING:
 		return s.handlePing(strm)
 	case protocol.PTCPF:
-		if len(p.TCPF) != 0 {
-			s.pConn.SetClientTCPF(strm.RemoteAddr(), p.TCPF)
+		if len(p.TCPF) != 0 && s.syntfo != nil {
+			// Only the syn-tfo transport exposes per-client TCP-flag rotation
+			// today; other transports (future T6.x) are expected to plumb
+			// this through their own surface or treat it as a no-op. The
+			// existing baseline tests exercise this code path with the
+			// syn-tfo default, so behaviour is unchanged.
+			s.syntfo.SocketConn().SetClientTCPF(strm.RemoteAddr(), p.TCPF)
 		}
 		return nil
 	case protocol.PTCP:
