@@ -95,11 +95,11 @@ func runSynTfoRoundTrip(t *testing.T, ctunBin string) {
 	})
 
 	// Start the server first so the tunnel port is listening before any SYNs
-	// arrive at it.
+	// arrive at it. The SYN-TFO server has no kernel TCP listener on the
+	// tunnel port — only pcap handles — so we probe the log for the readiness
+	// line instead of a TCP dial. See waitForLogSubstring's doc.
 	serverLog := startCtun(t, ctunBin, serverCfg, "server")
-	waitFor(t, fmt.Sprintf("server listening on :%d", tunnelPort), 10*time.Second, func() bool {
-		return tcpPortListening("127.0.0.1", tunnelPort)
-	}, serverLog)
+	waitForLogSubstring(t, "Server started", 10*time.Second, serverLog)
 
 	// Arm the sniffer BEFORE the client boots. We capture every TCP packet
 	// on the tunnel port so the client-side SYNs (with the TFO option) land

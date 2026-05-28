@@ -23,6 +23,17 @@
 # hosted ubuntu runners; a multiarch Docker container would also work
 # but adds an entire docker pull to the critical path.
 #
+# Apt sources on noble live in /etc/apt/sources.list.d/ubuntu.sources
+# in deb822 format; the legacy /etc/apt/sources.list is empty. After
+# `dpkg --add-architecture arm64` we must restrict the default mirrors
+# (archive.ubuntu.com, security.ubuntu.com) to amd64, because they do
+# not host arm64 packages and would otherwise 404 on apt-get update.
+# We do this by appending `Architectures: amd64` to every stanza in
+# ubuntu.sources, and add a dedicated arm64 list pointing at
+# ports.ubuntu.com pinned to the runner's distro (noble) so the cross
+# sysroot ABI matches the GCC sysroot. A legacy sed on
+# /etc/apt/sources.list is kept as defense-in-depth.
+#
 # Integration tests (T0.2 / T1.5 / T3.5 verification) run on Linux only
 # in the test-integration-linux job below. The integration tests under
 # test/integration/ require root (raw sockets / pcap) and self-skip on
@@ -111,14 +122,28 @@ jobs:
             - name: Install libpcap (Linux arm64 cross)
               if: matrix.goos == 'linux' && matrix.goarch == 'arm64'
               run: |
+                  set -euo pipefail
                   sudo dpkg --add-architecture arm64
-                  # Restrict the default sources.list to amd64 so apt does
-                  # not try to fetch arm64 packages from x86_64 mirrors.
+                  # Noble's apt sources live in deb822 format under
+                  # /etc/apt/sources.list.d/ubuntu.sources; pin every stanza
+                  # to amd64 so apt does not chase arm64 packages on
+                  # archive/security.ubuntu.com (which only host amd64/i386).
+                  # If the file already restricts architectures we leave it
+                  # alone; otherwise we append `Architectures: amd64` under
+                  # each `Types:` header (one per stanza).
+                  if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+                      if ! grep -qi '^Architectures:' /etc/apt/sources.list.d/ubuntu.sources; then
+                          sudo sed -i '/^Types:/a Architectures: amd64' \
+                              /etc/apt/sources.list.d/ubuntu.sources
+                      fi
+                  fi
+                  # Defense-in-depth for any older legacy /etc/apt/sources.list.
                   sudo sed -i 's/^deb /deb [arch=amd64] /' /etc/apt/sources.list || true
-                  # Add an arm64 source for ports.ubuntu.com.
-                  sudo tee /etc/apt/sources.list.d/arm64.list <<'EOF'
-                  deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ jammy main universe
-                  deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ jammy-updates main universe
+                  # Add an arm64 source for ports.ubuntu.com pinned to the
+                  # runner's distro so the cross sysroot ABI matches GCC.
+                  sudo tee /etc/apt/sources.list.d/arm64.list >/dev/null <<'EOF'
+                  deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ noble main universe
+                  deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports/ noble-updates main universe
                   EOF
                   sudo apt-get update
                   sudo apt-get install -y --no-install-recommends \

@@ -109,9 +109,10 @@ func runSecureTunnelRoundTrip(t *testing.T, ctunBin string) {
 	})
 
 	serverLog := startCtun(t, ctunBin, serverCfg, "server")
-	waitFor(t, fmt.Sprintf("server listening on :%d", tunnelPort), 10*time.Second, func() bool {
-		return tcpPortListening("127.0.0.1", tunnelPort)
-	}, serverLog)
+	// The SYN-TFO server has no kernel TCP listener on the tunnel port —
+	// only pcap handles — so we probe the log for the readiness line
+	// instead of a TCP dial. See waitForLogSubstring's doc.
+	waitForLogSubstring(t, "Server started", 10*time.Second, serverLog)
 
 	clientLog := startCtun(t, ctunBin, clientCfg, "client")
 	waitFor(t, fmt.Sprintf("SOCKS5 listening on :%d", socksPort), 10*time.Second, func() bool {
@@ -170,9 +171,8 @@ func Test_SecureTunnel_WrongPSK_ServerSilent(t *testing.T) {
 	})
 
 	serverLog := startCtun(t, bin, serverCfg, "server")
-	waitFor(t, fmt.Sprintf("server listening on :%d", tunnelPort), 10*time.Second, func() bool {
-		return tcpPortListening("127.0.0.1", tunnelPort)
-	}, serverLog)
+	// SYN-TFO server has no kernel TCP listener; probe the log instead.
+	waitForLogSubstring(t, "Server started", 10*time.Second, serverLog)
 
 	bpf := fmt.Sprintf("tcp and port %d", tunnelPort)
 	packets, stopSniffer := startSniffer(t, snifferConfig{

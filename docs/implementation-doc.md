@@ -588,6 +588,31 @@ go test -fuzz=FuzzProtocolUnmarshal -fuzztime=30s ./internal/protocol/
 
 ---
 
+### T4.7 — CI fixups: arm64 apt sources + integration-test server readiness
+
+**Scope:** Two T4.5 follow-ups surfaced by the first real CI run. Neither was caught locally because (a) cross-compile arm64 was never actually exercised on a noble runner and (b) the sudo-gated integration tests were never run on Linux.
+
+1. **arm64 build apt sources** — `dpkg --add-architecture arm64` followed by `apt-get update` fails because the runner's default apt sources (in `/etc/apt/sources.list.d/ubuntu.sources`, deb822 format on noble) are not restricted to amd64, so apt asks `security.ubuntu.com` for arm64 packages and 404s. The existing `sed` against `/etc/apt/sources.list` is a no-op on noble. Workflow also pins the added arm64 list to `jammy` while the runner is `noble`.
+2. **integration-test server readiness** — All sudo-gated tests time out at `waitFor("server listening on :<port>")`. The probe is `tcpPortListening` (TCP dial), but the SYN-TFO server has no kernel TCP listener on the tunnel port — only pcap send/recv handles. `tcpPortListening` for the server can never return true. The fixture `log.level: "warn"` also silences the actual "Server started — listening for packets on :PORT" line, so the failure diagnostic shows empty subprocess output.
+
+**Files touched:**
+- `.github/workflows/build.yml` (arm64 apt setup; pin to runner distro)
+- `test/integration/helpers_test.go` (add log-substring readiness helper)
+- `test/integration/smoke_syn_tfo_test.go`, `secure_tunnel_test.go` (server wait → log substring)
+- `test/integration/fixtures/server-syntfo.yaml`, `server-secure.yaml` (raise `log.level` so readiness line is emitted)
+
+**Dependencies:** T4.5
+
+**DoD:**
+- [ ] arm64 build job green on a hosted ubuntu-latest runner.
+- [ ] integration-tests job green on a hosted ubuntu-latest runner (root via `sudo -E`).
+- [ ] `tcpPortListening` is still used for the client (which DOES bind a real SOCKS5 net.Listen).
+- [ ] On failure, subprocess output includes the server's startup log so future regressions are diagnosable.
+
+**Verification:** Green CI on push to main.
+
+---
+
 ## Phase 5 — Optional: No-CGO Backend (Future)
 
 **Goal:** Add an AF_PACKET (Linux) and `/dev/bpf` (macOS) backend behind a build tag so users who care about static binaries can opt out of libpcap.

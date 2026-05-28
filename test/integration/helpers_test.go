@@ -281,6 +281,31 @@ func waitFor(t *testing.T, what string, timeout time.Duration, cond func() bool,
 	}
 }
 
+// waitForLogSubstring polls logBuf until its captured output contains want, or
+// the timeout elapses. This is the readiness probe for the SYN-TFO server,
+// which has no kernel TCP listener on the tunnel port — only pcap send/recv
+// handles — so a tcpPortListening dial against the tunnel port can never
+// succeed. The server's `flog.Infof("Server started - listening for packets
+// on :%d", ...)` line is the canonical "ready" signal; tests look for the
+// "Server started" prefix so the assertion does not bind to the port suffix.
+//
+// On timeout the failure message includes the substring searched and the full
+// captured log so future regressions are diagnosable from CI logs alone.
+func waitForLogSubstring(t *testing.T, want string, timeout time.Duration, logBuf *syncBuf) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		if strings.Contains(logBuf.String(), want) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timeout waiting for log substring %q after %s\n----- subprocess output -----\n%s",
+				want, timeout, logBuf.String())
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // SOCKS5 driver
 // ---------------------------------------------------------------------------

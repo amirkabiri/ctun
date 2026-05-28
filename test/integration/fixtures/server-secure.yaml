@@ -13,7 +13,10 @@
 role: "server"
 
 log:
-  level: "warn"
+  # Info so the "Server started - listening for packets on :PORT" readiness
+  # line is emitted; the integration tests grep the subprocess log for that
+  # prefix instead of a TCP dial (the SYN-TFO server has no kernel listener).
+  level: "info"
 
 transport_impl: "syn-tfo"
 cipher: "chacha20poly1305"
