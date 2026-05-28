@@ -263,7 +263,7 @@ func TestTransport_GateOptions_ValidPasses(t *testing.T) {
 	// session manager wired (t.mgr == nil — the test stub), the gate
 	// preserves T1.3 semantics: accept on TFO shape alone, payload is
 	// ignored. Pass nil to lock that fallback in.
-	if !tr.gateOptions(opts, nil) {
+	if !tr.gateOptions(opts, nil, nil) {
 		t.Fatalf("gateOptions returned false for valid TFO; want true")
 	}
 	if got := tr.counters.DroppedNoTFO(); got != 0 {
@@ -281,7 +281,7 @@ func TestTransport_GateOptions_MissingTFO_IncrementsNoTFOCounter(t *testing.T) {
 		{OptionType: layers.TCPOptionKindSACKPermitted, OptionLength: 2},
 	}
 	for i := 0; i < 3; i++ {
-		if tr.gateOptions(opts, nil) {
+		if tr.gateOptions(opts, nil, nil) {
 			t.Fatalf("iter %d: gateOptions returned true for missing TFO; want false", i)
 		}
 	}
@@ -303,7 +303,7 @@ func TestTransport_GateOptions_MalformedTFO_IncrementsMalformedCounter(t *testin
 		},
 	}
 	for i := 0; i < 2; i++ {
-		if tr.gateOptions(opts, nil) {
+		if tr.gateOptions(opts, nil, nil) {
 			t.Fatalf("iter %d: gateOptions returned true for malformed TFO; want false", i)
 		}
 	}

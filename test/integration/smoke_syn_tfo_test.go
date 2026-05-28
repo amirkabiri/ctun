@@ -69,6 +69,7 @@ func runSynTfoRoundTrip(t *testing.T, ctunBin string) {
 	t.Helper()
 
 	tunnelPort, socksPort := allocLoopbackPorts(t)
+	clientPort := allocClientLoopbackPort(t, tunnelPort, socksPort)
 	iface := lookupTestIface()
 	sharedKey := newSharedKey(t)
 
@@ -82,6 +83,7 @@ func runSynTfoRoundTrip(t *testing.T, ctunBin string) {
 	serverCfg := renderFixture(t, "server-syntfo.yaml", filepath.Join(scratch, "server.yaml"), fixtureParams{
 		TunnelPort: tunnelPort,
 		SocksPort:  socksPort,
+		ClientPort: clientPort,
 		Iface:      iface,
 		RouterMAC:  loopbackRouterMAC,
 		SharedKey:  sharedKey,
@@ -89,6 +91,7 @@ func runSynTfoRoundTrip(t *testing.T, ctunBin string) {
 	clientCfg := renderFixture(t, "client-syntfo.yaml", filepath.Join(scratch, "client.yaml"), fixtureParams{
 		TunnelPort: tunnelPort,
 		SocksPort:  socksPort,
+		ClientPort: clientPort,
 		Iface:      iface,
 		RouterMAC:  loopbackRouterMAC,
 		SharedKey:  sharedKey,

@@ -640,7 +640,59 @@ Repro inside an `ubuntu:24.04` container (`--cap-add=NET_RAW NET_ADMIN`, Go 1.25
 - `go vet ./...`, `gofmt -l .`, `go build ./...`, `go test -race -short ./...` clean on the macOS host.
 - Repro container (`ubuntu:24.04 + NET_RAW/NET_ADMIN + libpcap-dev + iptables + Go 1.25`) confirms the SerializeLayers error is gone on a loopback interface with an empty HardwareAddr.
 
-**Known follow-up (separate task, escalated to coordinator):** the sudo-gated `Test_Smoke_SynTfo` and `Test_SecureTunnel` round-trip tests do not pass after this fix alone. Root cause is independent of T4.8: production `cmd/run/{client,server}.go` never invokes `session.RunClientHandshake` / `session.RunServerHandshake` (and never installs a `HelloHandler` on the syntfo transport), so `syntfo.secureConn.WriteTo` returns `ErrNoSession` on the first KCP segment and the tunnel never carries data. T3.3 shipped the handshake primitives; the production-time driver was never wired. This is the next item to address; T4.8's scope is bounded to the pcap-layer EOF described above.
+**Known follow-up (separate task, escalated to coordinator):** the sudo-gated `Test_Smoke_SynTfo` and `Test_SecureTunnel` round-trip tests do not pass after this fix alone. Root cause is independent of T4.8: production `cmd/run/{client,server}.go` never invokes `session.RunClientHandshake` / `session.RunServerHandshake` (and never installs a `HelloHandler` on the syntfo transport), so `syntfo.secureConn.WriteTo` returns `ErrNoSession` on the first KCP segment and the tunnel never carries data. T3.3 shipped the handshake primitives; the production-time driver was never wired. This is the next item to address; T4.8's scope is bounded to the pcap-layer EOF described above. **Closed in T4.9.**
+
+---
+
+### T4.9 — Wire production handshake driver + pcap-poll timeout
+
+**Scope:** Close T4.8's flagged follow-up. T3.3 and T3.5 ticked DoD items for HELLO/HELLO_ACK wiring and the secure-tunnel round trip without ever exercising them on Linux; production startup neither drove `session.RunClientHandshake` on the client nor installed a `HelloHandler` on the server, and the server-side per-addr session map that `secureConn.WriteTo` is documented to consult was never built. After this task all six sudo-gated round-trip / silent-PSK paths pass under the Docker repro environment (`ubuntu:24.04` + `NET_RAW/NET_ADMIN` + `libpcap-dev` + `iptables` + Go 1.25).
+
+Two protocol decisions worth recording, both made in this task:
+
+1. **HELLO_ACK carries cookie=zero on the wire** — symmetric with HELLO. The client manager hasn't bound the new session at HELLO_ACK arrival time, so any non-zero cookie would either need a "pending handshake" pass-through in the gate or a synthetic LookupByCookie against a session the client has never registered. Going with cookie=zero adds one switch arm to `gateOptions` (FlagHello → handler, FlagHelloAck → upper layer) and keeps the cookie validator's invariants intact.
+2. **Client RecvHelloAck reads PacketConn directly, in the same goroutine as the session-layer retry loop**, rather than waiting on a "pump" goroutine that stashes HELLO_ACKs into a channel. With pcap reads now bounded by a poll timeout (see below), the same goroutine can sleep on a read deadline and be unblocked by ctx cancellation — the inversion the file header explains.
+
+The deeper bug T4.8 surfaced — pcap's `SetTimeout(pcap.BlockForever)` — also lands here because the production handshake driver is the first caller that actually needed deadline / ctx responsiveness on a quiet recv. Pre-T4.9, `socket.PacketConn.ReadFrom`'s deadline / ctx check was a one-shot: once `pcap.ReadPacketData` was in flight, only an arriving packet (or handle close) could release it. Wrong-PSK never produced an arriving packet, so the client handshake's 9 s ctx fired but couldn't interrupt the read, and `RunClientHandshake` never returned. Server-side SIGTERM had the same shape — the recv loop was blocked in pcap and ignored ctx cancel.
+
+Fix: `internal/socket/handle.go` sets `SetTimeout(250 ms)`; `internal/socket/socket.go ReadFrom` loops over `pcap.NextErrorTimeoutExpired` returns and re-checks ctx / deadline between iterations. The on-the-wire semantics are unchanged (caller still blocks until a real event); the only behavioural change is that ctx cancellation and read deadlines are now observable within ~250 ms.
+
+The clients' local pcap-recv port was also pinned (fixtures `client-syntfo.yaml`, `client-secure.yaml`): the pre-T4.9 `127.0.0.1:0` expanded to BPF `dst port 0`, which dropped every inbound packet from the server. Tests allocate a fresh free loopback port via `allocClientLoopbackPort` and pass it through the new `fixtureParams.ClientPort` field. The mangle/OUTPUT DROP-RST firewall rule, previously server-only, is now installed on both sides because pinning a real client port surfaces the kernel-RST race on inbound HELLO_ACK that the pre-T4.9 zero port masked.
+
+**Files touched:**
+- `internal/transport/syntfo/handshake.go` (new — `clientHandshakeSender`, `serverHandshakeSender`, `Transport.RunClientHandshake`, `Transport.InstallServerHandshakeHandler`)
+- `internal/transport/syntfo/syntfo.go` (extend gate to dispatch FlagHello vs FlagHelloAck; thread dst addr through the SYN options builder so the server can stamp the per-destination session's cookie)
+- `internal/transport/syntfo/secure_conn.go` (server-side fallback to per-addr session map in `WriteTo` when binding is unbound)
+- `internal/transport/syntfo/{gate_handshake,recv}_test.go` (signature updates for the widened gate)
+- `internal/socket/{handle,socket,send_handle,recv_handle}.go` (pcap poll timeout + ReadFrom loop; dst addr plumbed into SYNOptionsBuilder; src addr plumbed into SYNGate so the HELLO handler gets a real peer)
+- `internal/session/manager.go` (`AuthKey()` accessor so the production driver can derive the HMAC key the manager was built with)
+- `internal/client/{client,dial,timed_conn}.go` (drive `Transport.RunClientHandshake` between `transport.New` and `kcp.Dial`; handshake failures no longer abort `Client.Start` so SOCKS5 still binds; `ErrNoTunnelConn` surfaced for downstream dials)
+- `internal/server/server.go` (install the per-Transport HELLO handler before `kcp.Listen`)
+- `cmd/run/firewall_setup.go`, `internal/firewall/firewall.go`, `firewall_test.go` (DROP-RST rule installed on both sides; `firewallPort` uses the client's local pcap-recv port on the client side)
+- `test/integration/fixtures/client-{syntfo,secure}.yaml` (pin client port via `{{.ClientPort}}`; bump log level to `info` so subprocess log carries handshake-complete diagnostics)
+- `test/integration/{helpers_test,secure_tunnel_test,smoke_syn_tfo_test}.go` (allocate the client port, plumb it through `fixtureParams`, extend the wrong-PSK SOCKS5 wait to 15 s to absorb the handshake-budget worst case)
+
+**Dependencies:** T3.3, T3.5, T4.5, T4.7, T4.8
+
+**DoD:**
+- [x] `Transport.RunClientHandshake(ctx, peer, authKey)` returns the bound `*session.Session` on success and `ErrHandshakeTimeout` / `context.DeadlineExceeded` on failure.
+- [x] `Transport.InstallServerHandshakeHandler(ctx, authKey)` installs a handler that drives `session.RunServerHandshake` per inbound HELLO and writes the resulting session into the secureConn's per-addr map.
+- [x] HELLO and HELLO_ACK both ride on the wire with cookie=zero; the gate dispatches HELLO to the handler (drop-from-KCP) and HELLO_ACK to the upper layer (accept).
+- [x] Server-side `secureConn.WriteTo` looks up the destination's session in the per-addr map; never returns `ErrNoSession` for an addr the recv path has already accepted an AEAD frame from.
+- [x] Client-side `secureConn.WriteTo` continues to return `ErrNoSession` when called before the handshake completes (no silent plaintext downgrade).
+- [x] `pcap.ReadPacketData` no longer blocks longer than the configured poll timeout; ctx cancellation and read deadlines are observable within that window.
+- [x] All six sudo-gated round-trip / silent-PSK tests pass in the Docker repro: `Test_SecureTunnel` (both subtests), `Test_Smoke_SynTfo` (both subtests), `Test_SecureTunnel_WrongPSK_ServerSilent`, `Test_AntiReplay_ClientSendsN_AttackerReinjectsFirst`.
+- [x] In-memory tests still pass: `Test_SecureTunnel_WrongPSK_HandshakeFails`, `Test_SecureTunnel_TamperedCiphertext_DropAndRecover`.
+- [x] `go vet ./...`, `gofmt -l .`, `go build ./...`, `go test -count=1 -race -short ./...` clean on the macOS host.
+
+**Verification:**
+- `docker exec ctun-repro go test -count=1 -v ./test/integration/` returns PASS for every test listed under DoD. All six sudo-gated tests complete in under 14 s wall time total (vs. timing out indefinitely on `main`).
+- On a successful round trip the subprocess log carries `Server started — listening for packets on :PORT` and `client handshake complete: session bound (id=…)` — the readiness probes T4.7 introduced still work.
+
+**Open follow-ups (not in scope):**
+- Session-table GC on the server (sessions accumulate per inbound HELLO; the manager has no eviction policy yet). Track under the existing manager.go TODO.
+- Metrics scraper that exposes the syntfo + session counters. Existing follow-up under Cross-Cutting Concerns / Metrics.
+- The SOCKS5 binding being synchronous w.r.t. the handshake is a deliberate trade-off: connection-time backpressure beats accepting clients before the tunnel can carry traffic. If a future deployment wants async binding, that's a separate Phase-7+ refactor; the SOCKS5 wait in the wrong-PSK test absorbs the worst-case 9 s budget.
 
 ---
 

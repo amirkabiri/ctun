@@ -66,6 +66,19 @@ func (s *Server) Start() error {
 	// path to a zero-behaviour-change refactor.
 	if st, ok := tr.(*syntfo.Transport); ok {
 		s.syntfo = st
+		// T4.9: install the per-Transport HELLO handler that drives
+		// session.RunServerHandshake for every inbound HELLO. Before
+		// this wiring, the syn-tfo transport shipped the primitives
+		// (HelloHandler, SessionCookieProvider.Bind) but no production
+		// driver invoked them — every client request died with
+		// secureConn.WriteTo returning ErrNoSession. Installing this
+		// handler is what closes the loop. The handler must be in place
+		// BEFORE kcp.Listen because clients may race the server: a
+		// HELLO arriving before the handler is installed would be
+		// dropped at the gate (helloHandler==nil branch).
+		if err := st.InstallServerHandshakeHandler(ctx, s.mgr.AuthKey()); err != nil {
+			return fmt.Errorf("install server handshake handler: %w", err)
+		}
 	}
 
 	listener, err := kcp.Listen(s.cfg.Transport.KCP, tr)

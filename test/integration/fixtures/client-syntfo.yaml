@@ -13,7 +13,11 @@
 role: "client"
 
 log:
-  level: "warn"
+  # T4.9: bumped from "warn" to "info" so the client emits its startup +
+  # handshake-complete lines into the subprocess log buffer. The
+  # integration tests poll the buffer for failure diagnostics; running at
+  # "warn" hid every interesting line in the handshake-driven boot path.
+  level: "info"
 
 transport_impl: "syn-tfo"
 
@@ -23,7 +27,12 @@ socks5:
 network:
   interface: "{{.Iface}}"
   ipv4:
-    addr: "127.0.0.1:0"
+    # T4.9: pin a real, non-zero client port. The BPF recv filter is
+    # `tcp and dst port <Port>`; the pre-T4.9 fixture used :0 which
+    # made the filter `dst port 0` and silently dropped the
+    # server-side HELLO_ACK. ClientPort is allocated per-test from a
+    # free loopback port.
+    addr: "127.0.0.1:{{.ClientPort}}"
     router_mac: "{{.RouterMAC}}"
   tcp:
     local_flag: ["S"]

@@ -153,22 +153,31 @@ func buildApplyArgs(port uint16, isServer bool) [][]string {
 			"-j", "NOTRACK",
 		},
 	}
-	if isServer {
-		// mangle/OUTPUT drop RST flag on --sport: even with NOTRACK, the
-		// kernel will produce RSTs in response to inbound SYNs that don't
-		// match any listening socket. Server-only because the client
-		// isn't bound to the tunnel port, so it never receives those
-		// SYNs in the first place.
-		rules = append(rules, []string{
-			"-t", "mangle",
-			"-A", "OUTPUT",
-			"-p", "tcp",
-			"--sport", portStr,
-			"--tcp-flags", "RST", "RST",
-			"-m", "comment", "--comment", tag,
-			"-j", "DROP",
-		})
-	}
+	// mangle/OUTPUT drop RST flag on --sport: even with NOTRACK, the
+	// kernel will produce RSTs in response to inbound SYNs / SYN-ACKs
+	// addressed to the local pcap-recv port (which has no kernel
+	// listener). Both sides need this rule, symmetric — pre-T4.9 the
+	// client had no fixed local port so the rule was server-only;
+	// T4.9 pins a real client port (so HELLO_ACK can be filtered in
+	// via BPF), which also means the kernel will RST those inbound
+	// SYNs without a DROP guard.
+	//
+	// The port the rule binds to is whichever port THIS side is
+	// listening on with pcap — firewallPort() in cmd/run picks the
+	// correct one per role: cfg.Listen.Addr.Port on the server,
+	// cfg.Network.IPv4.Addr.Port (the client's pcap-recv port) on
+	// the client. The isServer flag is retained only for the log
+	// line in roleName(); the rule shape is identical.
+	_ = isServer
+	rules = append(rules, []string{
+		"-t", "mangle",
+		"-A", "OUTPUT",
+		"-p", "tcp",
+		"--sport", portStr,
+		"--tcp-flags", "RST", "RST",
+		"-m", "comment", "--comment", tag,
+		"-j", "DROP",
+	})
 	return rules
 }
 

@@ -58,17 +58,17 @@ func withMockFirewall(t *testing.T) *mockManager {
 }
 
 // newConfForTest returns a minimally-populated *conf.Conf suitable for
-// setupFirewall's port lookup. We only fill in the fields setupFirewall
-// touches: Firewall.Auto, Listen.Addr (for server) or Server.Addr (for
-// client). The rest of the conf is left zero — setupFirewall doesn't
-// read them.
+// setupFirewall's port lookup. We fill in the fields setupFirewall
+// touches: Firewall.Auto, Listen.Addr (server), and Network.IPv4.Addr
+// (client — T4.9 changed firewallPort to use the client's own pcap-recv
+// port rather than the destination server port).
 func newConfForTest(auto bool, isServer bool, port int) *conf.Conf {
 	c := &conf.Conf{}
 	c.Firewall.Auto = auto
 	if isServer {
 		c.Listen.Addr = &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: port}
 	} else {
-		c.Server.Addr = &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: port}
+		c.Network.IPv4.Addr = &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: port}
 	}
 	return c
 }
@@ -279,11 +279,14 @@ func TestFirewallPort(t *testing.T) {
 			t.Error("expected error for nil Listen.Addr; got nil")
 		}
 	})
-	t.Run("nil-server-addr", func(t *testing.T) {
+	t.Run("nil-client-network-addr", func(t *testing.T) {
+		// T4.9: client firewall now keys on cfg.Network.IPv4/IPv6.Addr
+		// instead of cfg.Server.Addr. An empty Conf still has no
+		// configured client port; firewallPort returns an error.
 		cfg := &conf.Conf{}
 		_, err := firewallPort(cfg, false)
 		if err == nil {
-			t.Error("expected error for nil Server.Addr; got nil")
+			t.Error("expected error for nil Network IPv4/IPv6 Addr; got nil")
 		}
 	})
 	t.Run("port-out-of-range", func(t *testing.T) {

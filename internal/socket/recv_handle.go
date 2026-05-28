@@ -19,15 +19,18 @@ import (
 // validates the TFO cookie against the session table by peeking into the
 // protocol-framed payload.
 //
-// Signature evolution (T1.3 → T3.3): T1.3 declared the gate as
-// `func([]layers.TCPOption) bool` — options only. T3.3 widens it to
+// Signature evolution (T1.3 → T3.3 → T4.9): T1.3 declared the gate as
+// `func([]layers.TCPOption) bool` — options only. T3.3 widened it to
 // `func([]layers.TCPOption, []byte) bool` so the gate can reach into the
 // inner protocol payload (cookie validation + HELLO routing both need
 // the SessionID / Flags from the framed payload, not just the TCP options).
-// The widening is small and contained — only the SYN-TFO transport
-// implements a gate — so we picked option (i) from the T3.3 brief over
-// option (ii) (moving the validation out of the gate). See syntfo.go's
-// gateOptions for the rationale captured at the call site.
+// T4.9 widens it again to surface the source address so the HELLO-routing
+// path can hand the registered HelloHandler a real peer addr (the T3.3
+// `src=nil` open follow-up is closed here). The widening is small and
+// contained — only the SYN-TFO transport implements a gate — so we picked
+// option (i) from the T3.3 brief over option (ii) (moving the validation
+// out of the gate). See syntfo.go's gateOptions for the rationale captured
+// at the call site.
 //
 // Contract:
 //   - The gate is invoked on every successfully-parsed inbound TCP packet,
@@ -46,7 +49,7 @@ import (
 // package directly — preserves the acyclic dependency: socket -> {nothing
 // in internal/transport}, syntfo -> socket. Mirror of the send-side
 // SYNOptionsBuilder pattern T1.2 introduced.
-type SYNGate func(options []layers.TCPOption, payload []byte) bool
+type SYNGate func(options []layers.TCPOption, payload []byte, src net.Addr) bool
 
 type RecvHandle struct {
 	handle *pcap.Handle
@@ -134,7 +137,13 @@ func (h *RecvHandle) Read() ([]byte, net.Addr, error) {
 		// protocol.Unmarshal the inner frame without re-parsing the
 		// packet. The byte slice aliases the original pcap buffer and
 		// MUST NOT be retained past the gate's return.
-		if h.synGate != nil && !h.synGate(tcp.Options, tcp.LayerPayload()) {
+		// T4.9: pass addr so the gate's HELLO-routing branch can hand the
+		// registered HelloHandler a real peer address (closing the T3.3
+		// open follow-up where src was nil). addr is the *net.UDPAddr the
+		// loop populated from the parsed IPv4/IPv6 + TCP src port a few
+		// lines above; it is the same pointer the upper layer receives
+		// when the gate accepts the packet.
+		if h.synGate != nil && !h.synGate(tcp.Options, tcp.LayerPayload(), addr) {
 			return nil, nil, nil
 		}
 	case layers.LayerTypeUDP:

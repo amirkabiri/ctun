@@ -158,6 +158,15 @@ func (m *Manager) EncKey() [32]byte {
 	return m.encKey
 }
 
+// AuthKey returns the 32-byte authentication key the manager was constructed
+// with. T4.9 wires the handshake drivers in cmd/run; both client and server
+// need the same key the manager uses to derive cookies so HELLO / HELLO_ACK
+// HMACs validate. Returning a copy (Go arrays are value types) keeps the
+// manager's stored key inviolate even if a caller mutates the returned array.
+func (m *Manager) AuthKey() [32]byte {
+	return m.authKey
+}
+
 // Counters returns the Manager's drop-path counters. The returned pointer is
 // stable for the lifetime of the Manager; callers read the counters via the
 // atomic Load methods.

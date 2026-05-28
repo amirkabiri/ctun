@@ -130,7 +130,7 @@ func TestGate_AcceptsHelloWithZeroCookie(t *testing.T) {
 	frame := makeFrame(t, 0, protocol.FlagHello, helloPayload)
 	zero := [CookieSize]byte{}
 
-	if got := tr.gateOptions(optsWithCookie(zero), frame); got {
+	if got := tr.gateOptions(optsWithCookie(zero), frame, nil); got {
 		t.Fatalf("gateOptions(HELLO,zero-cookie): got upper-layer accept (true), want drop (false; HELLO is handler-dispatched, not forwarded to KCP)")
 	}
 	if got := h.calls.Load(); got != 1 {
@@ -169,7 +169,7 @@ func TestGate_RejectsNonHelloWithZeroCookie(t *testing.T) {
 
 	frame := makeFrame(t, 0, protocol.FlagData, []byte("not a hello"))
 	zero := [CookieSize]byte{}
-	if got := tr.gateOptions(optsWithCookie(zero), frame); got {
+	if got := tr.gateOptions(optsWithCookie(zero), frame, nil); got {
 		t.Fatalf("gateOptions(DATA,zero-cookie): got accept, want drop")
 	}
 	if got := h.calls.Load(); got != 0 {
@@ -200,7 +200,7 @@ func TestGate_AcceptsDataWithValidCookie(t *testing.T) {
 	frame := makeFrame(t, sessionIDToUint32(sess.ID), protocol.FlagData, []byte("payload"))
 	cookie := sess.Cookie()
 
-	if got := tr.gateOptions(optsWithCookie(cookie), frame); !got {
+	if got := tr.gateOptions(optsWithCookie(cookie), frame, nil); !got {
 		t.Fatalf("gateOptions(DATA,valid-cookie): got drop, want accept")
 	}
 	if got := tr.counters.DroppedBadCookieValidator(); got != 0 {
@@ -228,7 +228,7 @@ func TestGate_RejectsDataWithWrongCookie(t *testing.T) {
 	wrong := sess.Cookie()
 	wrong[0] ^= 0x01
 
-	if got := tr.gateOptions(optsWithCookie(wrong), frame); got {
+	if got := tr.gateOptions(optsWithCookie(wrong), frame, nil); got {
 		t.Fatalf("gateOptions(DATA,wrong-cookie): got accept, want drop")
 	}
 	if got := tr.counters.DroppedBadCookieValidator(); got != 1 {
@@ -259,7 +259,7 @@ func TestGate_RejectsMalformedFrame_NonZeroCookie_UnknownSession(t *testing.T) {
 	bogus := []byte{0x00, 0x01, 0x02, 0x03, 0x04}
 	someCookie := [CookieSize]byte{0xFF, 0xFE, 0xFD, 0xFC, 0xFB, 0xFA, 0xF9, 0xF8}
 
-	if got := tr.gateOptions(optsWithCookie(someCookie), bogus); got {
+	if got := tr.gateOptions(optsWithCookie(someCookie), bogus, nil); got {
 		t.Fatalf("gateOptions(unregistered-cookie): got accept, want drop")
 	}
 	if got := tr.counters.DroppedBadCookieValidator(); got != 1 {
@@ -280,7 +280,7 @@ func TestGate_RejectsMalformedFrame_NonZeroCookie_UnknownSession(t *testing.T) {
 func TestGate_EmptyPayload_NonZeroCookie_UnknownSession(t *testing.T) {
 	tr := newGateTransport()
 	someCookie := [CookieSize]byte{0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22}
-	if got := tr.gateOptions(optsWithCookie(someCookie), nil); got {
+	if got := tr.gateOptions(optsWithCookie(someCookie), nil, nil); got {
 		t.Fatalf("gateOptions(empty payload, unregistered cookie): got accept, want drop")
 	}
 	if got := tr.counters.DroppedBadCookieValidator(); got != 1 {
@@ -299,7 +299,7 @@ func TestGate_EmptyPayload_NonZeroCookie_UnknownSession(t *testing.T) {
 func TestGate_EmptyPayload_ZeroCookie_DropsAsMalformed(t *testing.T) {
 	tr := newGateTransport()
 	zero := [CookieSize]byte{}
-	if got := tr.gateOptions(optsWithCookie(zero), nil); got {
+	if got := tr.gateOptions(optsWithCookie(zero), nil, nil); got {
 		t.Fatalf("gateOptions(empty payload, zero cookie): got accept, want drop")
 	}
 	if got := tr.counters.DroppedMalformedFrame(); got != 1 {
@@ -313,12 +313,12 @@ func TestGate_EmptyPayload_ZeroCookie_DropsAsMalformed(t *testing.T) {
 func TestGate_NoSessionManager_PreservesT13Semantics(t *testing.T) {
 	tr := &Transport{counters: NewCounters()}
 	opts := BuildSYNOptions(validCookie, 0)
-	if !tr.gateOptions(opts, nil) {
+	if !tr.gateOptions(opts, nil, nil) {
 		t.Fatalf("gateOptions(no-manager, valid TFO, nil payload): got drop, want accept")
 	}
 	// And again with an arbitrary payload — the no-manager branch must
 	// not look at it.
-	if !tr.gateOptions(opts, []byte("anything goes when no manager is wired")) {
+	if !tr.gateOptions(opts, []byte("anything goes when no manager is wired"), nil) {
 		t.Fatalf("gateOptions(no-manager, valid TFO, garbage payload): got drop, want accept")
 	}
 }

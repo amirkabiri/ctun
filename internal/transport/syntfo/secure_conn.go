@@ -228,11 +228,25 @@ func (s *secureConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 		// Client-side path: a SessionCookieProvider tracks the single
 		// bound session.
 		sess = s.binding.Bound()
-	} else {
-		// Server-side path (T3.5): look the destination's session up in
-		// the per-addr map populated by ReadFrom. Until the first inbound
-		// AEAD frame from addr has been processed there is no entry, in
-		// which case we return ErrNoSession rather than guessing.
+	}
+	if sess == nil {
+		// Server-side path (T3.5/T4.9): look the destination's
+		// session up in the per-addr map populated by ReadFrom.
+		// Until the first inbound AEAD frame from addr has been
+		// processed there is no entry, in which case we return
+		// ErrNoSession rather than guessing.
+		//
+		// Pre-T4.9, secureConn distinguished server from client via
+		// `binding != nil`. The same SessionCookieProvider type is
+		// installed on BOTH ends (the server one is never bound — it
+		// just tracks the "still pre-handshake, zero cookie" state
+		// for its outbound SYNs). After T4.9 the server's
+		// HelloHandler is the only thing that writes back during
+		// the handshake (via the plaintext transport.Send path, not
+		// secureConn.WriteTo), so the server's binding always stays
+		// unbound and Bound() returns nil here. Falling through to
+		// the addr-map lookup gives the server the right behaviour
+		// without needing a per-side flag on the secureConn.
 		sess = s.lookupAddrSession(addr)
 	}
 	if sess == nil {

@@ -86,6 +86,7 @@ func runSecureTunnelRoundTrip(t *testing.T, ctunBin string) {
 	t.Helper()
 
 	tunnelPort, socksPort := allocLoopbackPorts(t)
+	clientPort := allocClientLoopbackPort(t, tunnelPort, socksPort)
 	iface := lookupTestIface()
 	sharedKey := newSharedKey(t)
 
@@ -96,6 +97,7 @@ func runSecureTunnelRoundTrip(t *testing.T, ctunBin string) {
 	serverCfg := renderFixture(t, "server-secure.yaml", filepath.Join(scratch, "server.yaml"), fixtureParams{
 		TunnelPort: tunnelPort,
 		SocksPort:  socksPort,
+		ClientPort: clientPort,
 		Iface:      iface,
 		RouterMAC:  loopbackRouterMAC,
 		SharedKey:  sharedKey,
@@ -103,6 +105,7 @@ func runSecureTunnelRoundTrip(t *testing.T, ctunBin string) {
 	clientCfg := renderFixture(t, "client-secure.yaml", filepath.Join(scratch, "client.yaml"), fixtureParams{
 		TunnelPort: tunnelPort,
 		SocksPort:  socksPort,
+		ClientPort: clientPort,
 		Iface:      iface,
 		RouterMAC:  loopbackRouterMAC,
 		SharedKey:  sharedKey,
@@ -149,6 +152,7 @@ func Test_SecureTunnel_WrongPSK_ServerSilent(t *testing.T) {
 	bin := buildCtunBinary(t)
 
 	tunnelPort, socksPort := allocLoopbackPorts(t)
+	clientPort := allocClientLoopbackPort(t, tunnelPort, socksPort)
 	iface := lookupTestIface()
 
 	const expectedBody = "should-never-be-served"
@@ -158,6 +162,7 @@ func Test_SecureTunnel_WrongPSK_ServerSilent(t *testing.T) {
 	serverCfg := renderFixture(t, "server-secure.yaml", filepath.Join(scratch, "server.yaml"), fixtureParams{
 		TunnelPort: tunnelPort,
 		SocksPort:  socksPort,
+		ClientPort: clientPort,
 		Iface:      iface,
 		RouterMAC:  loopbackRouterMAC,
 		SharedKey:  newSharedKey(t), // PSK1
@@ -165,6 +170,7 @@ func Test_SecureTunnel_WrongPSK_ServerSilent(t *testing.T) {
 	clientCfg := renderFixture(t, "client-secure.yaml", filepath.Join(scratch, "client.yaml"), fixtureParams{
 		TunnelPort: tunnelPort,
 		SocksPort:  socksPort,
+		ClientPort: clientPort,
 		Iface:      iface,
 		RouterMAC:  loopbackRouterMAC,
 		SharedKey:  newSharedKey(t), // PSK2 — distinct from server's
@@ -185,7 +191,12 @@ func Test_SecureTunnel_WrongPSK_ServerSilent(t *testing.T) {
 	t.Cleanup(stopSniffer)
 
 	clientLog := startCtun(t, bin, clientCfg, "client")
-	waitFor(t, fmt.Sprintf("SOCKS5 listening on :%d", socksPort), 10*time.Second, func() bool {
+	// 15s rather than the 10s the happy-path tests use: with a wrong PSK
+	// the client's synchronous RunClientHandshake exhausts its full
+	// retry schedule (~7.75 s + 9 s ctx upper bound, T4.9) before
+	// startClient proceeds to SOCKS5 binding. The happy path finishes
+	// the handshake in <1 s.
+	waitFor(t, fmt.Sprintf("SOCKS5 listening on :%d", socksPort), 15*time.Second, func() bool {
 		return tcpPortListening("127.0.0.1", socksPort)
 	}, clientLog)
 

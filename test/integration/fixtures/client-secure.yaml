@@ -13,7 +13,10 @@
 role: "client"
 
 log:
-  level: "warn"
+  # T4.9: same readiness reason as client-syntfo.yaml — keep client logs
+  # at "info" so integration-test diagnostics capture startup and
+  # handshake-complete lines, not just warnings.
+  level: "info"
 
 transport_impl: "syn-tfo"
 cipher: "chacha20poly1305"
@@ -24,7 +27,10 @@ socks5:
 network:
   interface: "{{.Iface}}"
   ipv4:
-    addr: "127.0.0.1:0"
+    # T4.9: same reason as client-syntfo.yaml — pin a real client
+    # port so the pcap BPF filter accepts inbound HELLO_ACK / KCP
+    # traffic from the server.
+    addr: "127.0.0.1:{{.ClientPort}}"
     router_mac: "{{.RouterMAC}}"
   tcp:
     local_flag: ["S"]

@@ -59,6 +59,16 @@ func skipUnlessRunnable(t *testing.T) {
 type fixtureParams struct {
 	TunnelPort int
 	SocksPort  int
+	// ClientPort is the loopback port the client binds its pcap recv
+	// filter to. It MUST be a stable, non-zero value: the server-side
+	// HELLO_ACK and subsequent KCP traffic flow back to this port, and
+	// the client's BPF filter is `tcp and dst port <ClientPort>` (per
+	// internal/socket/recv_handle.go). Setting it to 0 (the pre-T4.9
+	// fixture default) made the filter `dst port 0`, which dropped
+	// every inbound packet from the server and left the handshake
+	// blocked indefinitely. Tests allocate a free port via
+	// grabFreeLoopbackPort and inject it as ClientPort.
+	ClientPort int
 	Iface      string
 	RouterMAC  string
 	SharedKey  string
@@ -128,6 +138,29 @@ func allocLoopbackPorts(t *testing.T) (tunnel, socks int) {
 		t.Fatalf("port allocator returned duplicate port %d", tunnel)
 	}
 	return tunnel, socks
+}
+
+// allocClientLoopbackPort allocates a stable, non-zero loopback port the
+// client can bind its pcap BPF recv filter to. The pre-T4.9 fixtures
+// used 127.0.0.1:0 which expanded to BPF `dst port 0` — a filter that
+// matches no real traffic and left the handshake hanging because no
+// HELLO_ACK was ever delivered to the client. Returning a fresh free
+// port closes that hole.
+func allocClientLoopbackPort(t *testing.T, exclude ...int) int {
+	t.Helper()
+	for {
+		p := grabFreeLoopbackPort(t)
+		dup := false
+		for _, e := range exclude {
+			if p == e {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			return p
+		}
+	}
 }
 
 func grabFreeLoopbackPort(t *testing.T) int {

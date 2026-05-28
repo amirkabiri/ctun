@@ -9,6 +9,8 @@ import (
 	"os"
 	"sync/atomic"
 	"time"
+
+	"github.com/gopacket/gopacket/pcap"
 )
 
 type PacketConn struct {
@@ -50,6 +52,24 @@ func New(ctx context.Context, cfg *conf.Network) (*PacketConn, error) {
 	return conn, nil
 }
 
+// ReadFrom blocks until a packet is available, the context is cancelled,
+// or the read deadline (if any) elapses. The underlying pcap handle is
+// configured with a short poll timeout (pcapPollTimeout in handle.go) so
+// each individual ReadPacketData call returns within a bounded window;
+// this method then loops, suppressing the pcap-timeout pseudo-error and
+// re-checking ctx/deadline between iterations. The pre-T4.9 BlockForever
+// configuration made the ctx/deadline checks here a one-shot: once the
+// inner read entered the kernel, only an arriving packet could release
+// it. The new behaviour preserves the on-the-wire semantics (still
+// blocking from the caller's POV until a real event) while making
+// cancellation observable, which is what lets SIGTERM shut down the
+// recv loop and what lets the wrong-PSK handshake abandon on ctx
+// timeout.
+//
+// The recv handle's gate-drop path (returning nil/nil/nil for packets
+// the SYN gate rejected) is also looped here, matching the legacy
+// behaviour: callers continue to receive only "real" packets or
+// terminal errors.
 func (c *PacketConn) ReadFrom(data []byte) (n int, addr net.Addr, err error) {
 	var timer *time.Timer
 	var deadline <-chan time.Time
@@ -59,21 +79,34 @@ func (c *PacketConn) ReadFrom(data []byte) (n int, addr net.Addr, err error) {
 		deadline = timer.C
 	}
 
-	select {
-	case <-c.ctx.Done():
-		return 0, nil, c.ctx.Err()
-	case <-deadline:
-		return 0, nil, os.ErrDeadlineExceeded
-	default:
-	}
+	for {
+		select {
+		case <-c.ctx.Done():
+			return 0, nil, c.ctx.Err()
+		case <-deadline:
+			return 0, nil, os.ErrDeadlineExceeded
+		default:
+		}
 
-	payload, addr, err := c.recvHandle.Read()
-	if err != nil {
-		return 0, nil, err
+		payload, paddr, rerr := c.recvHandle.Read()
+		if rerr != nil {
+			// pcap returns NextErrorTimeoutExpired when the poll
+			// window elapses with no packet. Loop and re-check
+			// ctx/deadline. Any other error is terminal (handle
+			// closed, kernel error) — bubble it up.
+			if rerr == pcap.NextErrorTimeoutExpired {
+				continue
+			}
+			return 0, nil, rerr
+		}
+		if payload == nil {
+			// Gate dropped the packet (or no app layer); look for
+			// the next one.
+			continue
+		}
+		n = copy(data, payload)
+		return n, paddr, nil
 	}
-	n = copy(data, payload)
-
-	return n, addr, nil
 }
 
 func (c *PacketConn) WriteTo(data []byte, addr net.Addr) (n int, err error) {

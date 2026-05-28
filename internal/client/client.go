@@ -32,8 +32,18 @@ func (c *Client) Start(ctx context.Context) error {
 	for i := range c.cfg.Transport.Conn {
 		tc, err := newTimedConn(ctx, c.cfg, c.mgr)
 		if err != nil {
+			// T4.9: handshake failures (notably the WrongPSK case the
+			// integration suite covers) leave c.iter.Items empty.
+			// Returning the error here used to short-circuit
+			// startClient before SOCKS5 came up, which made the
+			// Wrong-PSK test's "SOCKS5 listening" probe time out
+			// before it could exercise the user-visible failure
+			// mode (HTTP request through SOCKS5 must fail). Logging
+			// and continuing keeps SOCKS5's listener-bind path
+			// reachable so callers see the failure via the HTTP
+			// dialer's error, not via an early Start abort.
 			flog.Errorf("failed to create connection %d: %v", i+1, err)
-			return err
+			continue
 		}
 		flog.Debugf("client connection %d created successfully", i+1)
 		c.iter.Items = append(c.iter.Items, tc)

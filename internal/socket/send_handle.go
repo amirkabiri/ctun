@@ -42,12 +42,18 @@ type TCPF struct {
 // pcap wrapper. tsVal is the timestamp value the caller wants stamped into
 // the Timestamps option.
 //
+// dstAddr (T4.9) is the destination IP+port the packet is being sent to.
+// The server-side cookie provider uses it to look up the per-destination
+// session's cookie — without it, server-to-client packets would all carry
+// the same (or zero) cookie and the client gate would drop them. dstAddr
+// may be nil if the caller doesn't have one (legacy / test paths).
+//
 // Keeping this as a function-typed hook — rather than importing the syntfo
 // package directly — preserves an acyclic dependency: socket -> {nothing in
 // internal/transport}, syntfo -> socket. If a future transport wants a
 // different option set it installs its own builder; the default behaviour
 // when no builder is installed is the pre-T1.2 paqet option set.
-type SYNOptionsBuilder func(tsVal uint32) []layers.TCPOption
+type SYNOptionsBuilder func(tsVal uint32, dstAddr *net.UDPAddr) []layers.TCPOption
 
 // SYNSeqDeriver returns the TCP sequence number for an outgoing SYN. T0.3
 // routed the seq-entropy fix to T1.2; we accept a pluggable derivation so
@@ -196,7 +202,11 @@ func (h *SendHandle) buildIPv6Header(dstIP net.IP) *layers.IPv6 {
 	return ip
 }
 
-func (h *SendHandle) buildTCPHeader(dstPort uint16, f conf.TCPF) *layers.TCP {
+func (h *SendHandle) buildTCPHeader(dstAddr *net.UDPAddr, f conf.TCPF) *layers.TCP {
+	dstPort := uint16(0)
+	if dstAddr != nil {
+		dstPort = uint16(dstAddr.Port)
+	}
 	tcp := h.tcpPool.Get().(*layers.TCP)
 	*tcp = layers.TCP{
 		SrcPort: layers.TCPPort(h.srcPort),
@@ -211,9 +221,11 @@ func (h *SendHandle) buildTCPHeader(dstPort uint16, f conf.TCPF) *layers.TCP {
 		// Option set: prefer the transport-supplied builder (syntfo installs
 		// one carrying the TFO option, T1.2). Fall back to the legacy
 		// option set when no builder is installed so non-syntfo callers
-		// (tests, other transports) keep the pre-T1.2 behaviour.
+		// (tests, other transports) keep the pre-T1.2 behaviour. T4.9
+		// passes dstAddr so syntfo's session-aware cookie provider can
+		// look up the right session's cookie for each destination.
 		if h.synOptionsBuilder != nil {
-			tcp.Options = h.synOptionsBuilder(tsVal)
+			tcp.Options = h.synOptionsBuilder(tsVal, dstAddr)
 		} else {
 			tcp.Options = []layers.TCPOption{
 				{OptionType: layers.TCPOptionKindMSS, OptionLength: 4, OptionData: []byte{0x05, 0xb4}},
@@ -275,7 +287,7 @@ func (h *SendHandle) Write(payload []byte, addr *net.UDPAddr) error {
 	dstPort := uint16(addr.Port)
 
 	f := h.getClientTCPF(dstIP, dstPort)
-	tcpLayer := h.buildTCPHeader(dstPort, f)
+	tcpLayer := h.buildTCPHeader(addr, f)
 	defer h.tcpPool.Put(tcpLayer)
 
 	var ipLayer gopacket.SerializableLayer

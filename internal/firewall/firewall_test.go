@@ -40,8 +40,12 @@ func TestErrNotImplemented_IsTyped(t *testing.T) {
 // example/server.yaml.example, with the ctun-<port> comment tag added.
 func TestLinuxManager_BuildArgs(t *testing.T) {
 	clientArgs := buildApplyArgs(9999, false)
-	if len(clientArgs) != 2 {
-		t.Fatalf("client side should emit exactly 2 rules; got %d: %v", len(clientArgs), clientArgs)
+	// T4.9: both sides now emit the same three rules — the mangle
+	// RST-drop is symmetric because the client now binds a fixed
+	// pcap-recv port (cfg.Network.IPv4.Addr.Port) and the kernel
+	// would RST inbound SYNs to that port without the guard.
+	if len(clientArgs) != 3 {
+		t.Fatalf("client side should emit exactly 3 rules; got %d: %v", len(clientArgs), clientArgs)
 	}
 
 	serverArgs := buildApplyArgs(9999, true)
@@ -49,7 +53,7 @@ func TestLinuxManager_BuildArgs(t *testing.T) {
 		t.Fatalf("server side should emit exactly 3 rules; got %d: %v", len(serverArgs), serverArgs)
 	}
 
-	wantClient := [][]string{
+	want := [][]string{
 		{
 			"-t", "raw",
 			"-A", "PREROUTING",
@@ -66,23 +70,21 @@ func TestLinuxManager_BuildArgs(t *testing.T) {
 			"-m", "comment", "--comment", "ctun-9999",
 			"-j", "NOTRACK",
 		},
+		{
+			"-t", "mangle",
+			"-A", "OUTPUT",
+			"-p", "tcp",
+			"--sport", "9999",
+			"--tcp-flags", "RST", "RST",
+			"-m", "comment", "--comment", "ctun-9999",
+			"-j", "DROP",
+		},
 	}
-	if !reflect.DeepEqual(clientArgs, wantClient) {
-		t.Errorf("client argv mismatch\n got:  %v\n want: %v", clientArgs, wantClient)
+	if !reflect.DeepEqual(clientArgs, want) {
+		t.Errorf("client argv mismatch\n got:  %v\n want: %v", clientArgs, want)
 	}
-
-	wantServer := append([][]string{}, wantClient...)
-	wantServer = append(wantServer, []string{
-		"-t", "mangle",
-		"-A", "OUTPUT",
-		"-p", "tcp",
-		"--sport", "9999",
-		"--tcp-flags", "RST", "RST",
-		"-m", "comment", "--comment", "ctun-9999",
-		"-j", "DROP",
-	})
-	if !reflect.DeepEqual(serverArgs, wantServer) {
-		t.Errorf("server argv mismatch\n got:  %v\n want: %v", serverArgs, wantServer)
+	if !reflect.DeepEqual(serverArgs, want) {
+		t.Errorf("server argv mismatch\n got:  %v\n want: %v", serverArgs, want)
 	}
 
 	// Sanity: every rule must include the comment tag, otherwise Cleanup

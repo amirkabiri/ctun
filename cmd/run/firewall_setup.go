@@ -104,10 +104,22 @@ func setupFirewall(ctx context.Context, cfg *conf.Conf, isServer bool) (cleanup 
 	return cleanup, nil
 }
 
-// firewallPort picks the tunnel port from the configuration. Server
-// listens on cfg.Listen.Addr.Port; client connects to cfg.Server.Addr.Port.
-// Both are validated to be non-zero by the conf package before this
-// function is called.
+// firewallPort picks the local tunnel port THIS side listens on with
+// pcap — the port the firewall rules need to tag.
+//
+// Server: cfg.Listen.Addr.Port (the published tunnel port).
+// Client (T4.9): cfg.Network.IPv4.Addr.Port (the client's local
+// pcap-recv port). Pre-T4.9 the client side passed
+// cfg.Server.Addr.Port (i.e. the SERVER's port), which was correct
+// for the outbound-NOTRACK-on-sport rule only by coincidence — the
+// kernel-RST issue on the inbound HELLO_ACK was masked because the
+// client port was zero and the BPF filter dropped every inbound
+// packet at the pcap layer. Pinning a real client port surfaces the
+// kernel-RST race; routing the firewall to the client's own port
+// closes it.
+//
+// Both ports are validated to be non-zero by the conf package before
+// this function is called.
 func firewallPort(cfg *conf.Conf, isServer bool) (uint16, error) {
 	var port int
 	if isServer {
@@ -116,10 +128,17 @@ func firewallPort(cfg *conf.Conf, isServer bool) (uint16, error) {
 		}
 		port = cfg.Listen.Addr.Port
 	} else {
-		if cfg.Server.Addr == nil {
-			return 0, errors.New("firewall: client server address is nil; cannot determine tunnel port")
+		// Client: pick the local pcap-recv port. Prefer IPv4 (the
+		// configured family in every test/example fixture); IPv6 is
+		// the fallback when only v6 is configured.
+		switch {
+		case cfg.Network.IPv4.Addr != nil:
+			port = cfg.Network.IPv4.Addr.Port
+		case cfg.Network.IPv6.Addr != nil:
+			port = cfg.Network.IPv6.Addr.Port
+		default:
+			return 0, errors.New("firewall: client network address is nil; cannot determine local tunnel port")
 		}
-		port = cfg.Server.Addr.Port
 	}
 	if port <= 0 || port > 0xFFFF {
 		return 0, fmt.Errorf("firewall: tunnel port %d out of range", port)

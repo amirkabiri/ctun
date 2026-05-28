@@ -102,11 +102,15 @@ type Transport struct {
 }
 
 // HelloHandler is the per-Transport hook the gate dispatches to when an
-// inbound frame is identified as a HELLO (Flags=FlagHello, SessionID=0,
-// cookie=zero). The hook is the bridge between the per-packet recv path
-// and the higher-level session.RunServerHandshake call: the handler is
-// responsible for validating the HELLO bytes, minting a session via the
-// session.Manager, and sending HELLO_ACK back via Transport.Send.
+// inbound frame is identified as a handshake frame — either HELLO
+// (Flags=FlagHello, cookie=zero, client→server) or HELLO_ACK
+// (Flags=FlagHelloAck, cookie=zero, server→client). The hook is the
+// bridge between the per-packet recv path and the higher-level
+// session.RunServerHandshake / RunClientHandshake calls: the handler
+// is responsible for discriminating on Flags, validating the bytes,
+// minting (server) or binding (client) the session, and either pushing
+// HELLO_ACK back (server) or delivering it to the client-side waiter
+// (client).
 //
 // frame is the parsed protocol.Message; the handler reads frame.Payload
 // (the HELLO bytes) and the source address from src. The payload slice
@@ -192,8 +196,28 @@ func New(cfg transport.Config) (transport.Transport, error) {
 	// option with the current cookie. The closure captures ctx via the
 	// outer function's variable; provider implementations may use it once
 	// the static stub is replaced.
-	pConn.SetSYNOptionsBuilder(func(tsVal uint32) []layers.TCPOption {
+	//
+	// T4.9: the builder is called per outbound packet WITH the dst
+	// addr. On the SERVER, the cookie depends on which session the
+	// destination belongs to (the server's binding is never bound,
+	// so falling back on the client-side path's Cookie() returns
+	// zero — fatal for the client's gate). We resolve via the
+	// secureConn's per-addr session map, which ReadFrom populates on
+	// every accepted AEAD frame. On the CLIENT, the SessionCookieProvider
+	// is Bind'd post-handshake and Cookie() returns the right value
+	// regardless of dstAddr.
+	pConn.SetSYNOptionsBuilder(func(tsVal uint32, dstAddr *net.UDPAddr) []layers.TCPOption {
 		cookie := t.cookies.Cookie(ctx)
+		// If we have a server-side per-addr session map and the
+		// caller-supplied cookie is the zero sentinel (which means
+		// "no per-Transport binding has bound a session yet" — the
+		// usual case on the server), consult the addr map to find
+		// the right session for this destination.
+		if dstAddr != nil && t.secure != nil && cookie == ([CookieSize]byte{}) {
+			if sess := t.secure.lookupAddrSession(dstAddr); sess != nil {
+				cookie = sess.Cookie()
+			}
+		}
 		return BuildSYNOptions(cookie, tsVal)
 	})
 
@@ -264,7 +288,13 @@ func New(cfg transport.Config) (transport.Transport, error) {
 // The method takes the syntfo Counters via t.counters; it is safe for
 // concurrent use because both Counters and session.Counters are built on
 // atomic.Uint64.
-func (t *Transport) gateOptions(options []layers.TCPOption, payload []byte) bool {
+//
+// T4.9: the gate now receives the source address so the HELLO-routing
+// branch can hand the registered HelloHandler the real peer addr (the
+// T3.3 "src=nil open follow-up" closed in this task). Tests that drive
+// the gate directly pass nil — the handler simply ignores src in the
+// recordingHandler stub.
+func (t *Transport) gateOptions(options []layers.TCPOption, payload []byte, src net.Addr) bool {
 	cookie, status := classifyTFO(options)
 	switch status {
 	case tfoStatusMissing:
@@ -291,11 +321,44 @@ func (t *Transport) gateOptions(options []layers.TCPOption, payload []byte) bool
 
 	isZeroCookie := cookie == ([CookieSize]byte{})
 	if isZeroCookie {
-		// Zero-cookie sentinel routes the HELLO path. The HELLO payload is
-		// plaintext (handshake frames bypass the AEAD wrapper per design
-		// §8.4 and the T3.3 plaintext-handshake decision), so the gate can
-		// still parse it directly. Anything else with the zero cookie is
-		// either a buggy client or a probe and gets dropped.
+		// Zero-cookie sentinel routes the handshake path. The HELLO /
+		// HELLO_ACK payloads are plaintext (handshake frames bypass
+		// the AEAD wrapper per design §8.4 and the T3.3 plaintext-
+		// handshake decision), so the gate can still parse them
+		// directly. Anything else with the zero cookie is either a
+		// buggy client or a probe and gets dropped.
+		//
+		// T4.9 split the zero-cookie branch on Flags:
+		//
+		//   - FlagHello (client→server): dispatch to the installed
+		//     HelloHandler (server-side wiring in T4.9 installs one
+		//     that drives session.RunServerHandshake) and signal
+		//     drop=false to the upper layer. HELLO bytes never bubble
+		//     to KCP — they are a transport-internal control frame.
+		//
+		//   - FlagHelloAck (server→client): signal drop=true (accept)
+		//     so the bytes bubble up via secureConn.ReadFrom's
+		//     plaintext-FlagHelloAck fallback to the client's
+		//     RunClientHandshake driver. The driver reads directly
+		//     from PacketConn() during the handshake (KCP is not yet
+		//     dialed), parses the bytes as a HelloAck, and proceeds.
+		//
+		//     Routing HELLO_ACK to the upper layer (rather than via a
+		//     handler stash) is what makes the client-side handshake
+		//     work on top of the pcap-driven PacketConn: pcap is
+		//     configured BlockForever, so a separate "pump" goroutine
+		//     cannot be cancelled mid-read. Driving the read in the
+		//     same goroutine as RunClientHandshake's retry loop —
+		//     directly via PacketConn() — sidesteps the cancellation
+		//     problem because the read is in the goroutine that the
+		//     retry schedule already manages.
+		//
+		// HELLO_ACK cookie=zero rationale: the server emits HELLO_ACK
+		// BEFORE the client has bound a session, so the client could
+		// not LookupByCookie anything sensible if the server stamped
+		// the new session's cookie on the SYN. Sticking with zero is
+		// symmetric with HELLO and keeps the gate's routing simple.
+		// Documented in docs/implementation-doc.md T4.9.
 		if len(payload) == 0 {
 			t.counters.incMalformedFrame()
 			return false
@@ -305,33 +368,25 @@ func (t *Transport) gateOptions(options []layers.TCPOption, payload []byte) bool
 			t.counters.incMalformedFrame()
 			return false
 		}
-		if msg.Flags != protocol.FlagHello {
-			// Non-HELLO frame with the zero sentinel cookie. Per design
-			// §8.4 the zero cookie is reserved for HELLO. Drop.
+		switch msg.Flags {
+		case protocol.FlagHello:
+			// Dispatch to handler (server-side), drop=false to upper
+			// layer.
+			t.helloMu.Lock()
+			h := t.helloHandler
+			t.helloMu.Unlock()
+			if h != nil {
+				h(context.Background(), msg, src)
+			}
+			return false
+		case protocol.FlagHelloAck:
+			// Accept to upper layer (client-side RunClientHandshake
+			// reads directly).
+			return true
+		default:
 			t.counters.incNonHelloZeroCookie()
 			return false
 		}
-		// Candidate HELLO. Dispatch to the registered handler (if any)
-		// and signal "drop" to the upper layer so the HELLO bytes do
-		// not bubble up to KCP (which would see them as garbage). The
-		// upper layer does not need to know about HELLO — the handler
-		// owns the post-validation work.
-		t.helloMu.Lock()
-		h := t.helloHandler
-		t.helloMu.Unlock()
-		if h != nil {
-			// We do not have an addr here at the gate level — the
-			// gate's contract from internal/socket only passes
-			// options+payload. T3.3 ships the hook with src=nil and
-			// expects T3.5's full wiring to extend the gate plumbing
-			// to surface the source address; until then the handler
-			// must reach the source via a side channel (the recv
-			// loop's own bookkeeping). The zero-cookie HELLO routing
-			// is what T3.3 wires today; the source-address plumbing
-			// is the open follow-up.
-			h(context.Background(), msg, nil)
-		}
-		return false
 	}
 
 	// Non-zero cookie path: with AEAD-wrapped data frames (T3.4) the inner
