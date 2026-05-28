@@ -613,6 +613,37 @@ go test -fuzz=FuzzProtocolUnmarshal -fuzztime=30s ./internal/protocol/
 
 ---
 
+### T4.8 — CI fixups: loopback SrcMAC normalisation + serialize-error diagnostics
+
+**Scope:** Second-round T4.5 follow-up surfaced once T4.7 unblocked the readiness probe and the sudo-gated integration tests started executing on the hosted ubuntu-latest runner. With the server reachable and SOCKS5 listening, every test still failed with `Get http://...: EOF` and the silent-PSK test's own diagnostic reported "observed 0 client→server SYNs" — impossible if the pcap inject path was working.
+
+Repro inside an `ubuntu:24.04` container (`--cap-add=NET_RAW NET_ADMIN`, Go 1.25, libpcap-dev, iptables) confirmed:
+
+1. **Empty `lo.HardwareAddr` on Linux.** `net.InterfaceByName("lo").HardwareAddr` returns a nil/zero-length slice on noble (and every other distro tested). The Ethernet pool in `internal/socket/send_handle.go:NewSendHandle` captures that empty value into `layers.Ethernet{SrcMAC: cfg.Interface.HardwareAddr}`. `gopacket.layers.Ethernet.SerializeTo` rejects any `SrcMAC` whose length is not 6 with the literal error `"invalid src MAC: "` (verified at `gopacket@v1.5.0/layers/ethernet.go:69-73`). `gopacket.SerializeLayers` therefore fails on every outbound packet, the error propagates up through `PacketConn.WriteTo`, and KCP swallows it silently inside its update goroutine. End state: zero packets on the wire, no diagnostic anywhere.
+2. **Pcap LinkType on `lo` is `Ethernet` (DLT_EN10MB)** on noble — verified with a one-shot Go probe against an open pcap handle. The hardcoded `layers.LayerTypeEthernet` in `internal/socket/recv_handle.go:Read` is the correct initial decoder, so no recv-side change is needed beyond a verification comment noting the platforms we've checked.
+
+**Files touched:**
+- `internal/socket/send_handle.go` (normalise empty `Interface.HardwareAddr` to `net.HardwareAddr{0,0,0,0,0,0}`; add `writeSerializeErr` / `writePcapErr` atomic counters and a one-shot warn-level log per failure mode so silent KCP-swallowed errors surface in operator/CI logs without per-packet spam)
+- `internal/socket/recv_handle.go` (comment documenting that `LayerTypeEthernet` is correct on every supported platform; no behaviour change)
+- `docs/implementation-doc.md` (this entry)
+
+**Dependencies:** T4.5, T4.7
+
+**DoD:**
+- [ ] `net.HardwareAddr` of length != 6 on the configured interface is normalised to six zero bytes; a real MAC on non-loopback interfaces is preserved unchanged.
+- [ ] `gopacket.SerializeLayers` failures bump `writeSerializeErr` and emit exactly one `flog.Warnf` per `SendHandle` lifetime (subsequent failures are counter-only).
+- [ ] `pcap.WritePacketData` failures bump `writePcapErr` and emit exactly one `flog.Warnf` per `SendHandle` lifetime.
+- [ ] `recv_handle.go` carries an inline note recording the platforms on which `LinkType` was verified to equal Ethernet, so a future regression on a non-Ethernet link surface is debuggable from the source alone.
+- [ ] `Test_SecureTunnel_WrongPSK_HandshakeFails`, `Test_SecureTunnel_TamperedCiphertext_DropAndRecover`, and `Test_AntiReplay_ClientSendsN_AttackerReinjectsFirst` (the in-memory tests that were already green) still pass — no regression.
+
+**Verification:**
+- `go vet ./...`, `gofmt -l .`, `go build ./...`, `go test -race -short ./...` clean on the macOS host.
+- Repro container (`ubuntu:24.04 + NET_RAW/NET_ADMIN + libpcap-dev + iptables + Go 1.25`) confirms the SerializeLayers error is gone on a loopback interface with an empty HardwareAddr.
+
+**Known follow-up (separate task, escalated to coordinator):** the sudo-gated `Test_Smoke_SynTfo` and `Test_SecureTunnel` round-trip tests do not pass after this fix alone. Root cause is independent of T4.8: production `cmd/run/{client,server}.go` never invokes `session.RunClientHandshake` / `session.RunServerHandshake` (and never installs a `HelloHandler` on the syntfo transport), so `syntfo.secureConn.WriteTo` returns `ErrNoSession` on the first KCP segment and the tunnel never carries data. T3.3 shipped the handshake primitives; the production-time driver was never wired. This is the next item to address; T4.8's scope is bounded to the pcap-layer EOF described above.
+
+---
+
 ## Phase 5 — Optional: No-CGO Backend (Future)
 
 **Goal:** Add an AF_PACKET (Linux) and `/dev/bpf` (macOS) backend behind a build tag so users who care about static binaries can opt out of libpcap.

@@ -84,6 +84,15 @@ func (h *RecvHandle) Read() ([]byte, net.Addr, error) {
 	if err != nil {
 		return nil, nil, err
 	}
+	// LayerTypeEthernet is the right initial decoder on every platform we
+	// support today: Linux lo reports DLT_EN10MB (Ethernet) — verified on
+	// Ubuntu 24.04 noble during the T4.8 repro — Linux non-loopback
+	// interfaces are obviously Ethernet, macOS lo0 and en* surface as
+	// DLT_NULL only when accessed via raw BPF (which we don't), and
+	// Windows Npcap presents Ethernet for all interfaces. If a future
+	// platform/interface surfaces a non-Ethernet link type, the right
+	// fix is to mirror test/integration/pcap_helpers.go's
+	// `gopacket.NewPacketSource(handle, handle.LinkType())` pattern here.
 	p := gopacket.NewPacket(data, layers.LayerTypeEthernet, gopacket.NoCopy)
 
 	addr := &net.UDPAddr{}

@@ -2,6 +2,7 @@ package socket
 
 import (
 	"ctun/internal/conf"
+	"ctun/internal/flog"
 	"ctun/internal/pkg/hash"
 	"ctun/internal/pkg/iterator"
 	"encoding/binary"
@@ -16,6 +17,17 @@ import (
 	"github.com/gopacket/gopacket/layers"
 	"github.com/gopacket/gopacket/pcap"
 )
+
+// zeroMAC is the six-byte all-zero MAC used as the Ethernet SrcMAC when the
+// configured interface reports an empty HardwareAddr — the typical case on
+// the Linux loopback interface (`lo`), where net.InterfaceByName("lo").
+// HardwareAddr is nil/zero-length. gopacket's Ethernet.SerializeTo rejects
+// any SrcMAC whose length is not 6 with "invalid src MAC", so without this
+// normalisation every WritePacketData on lo would fail at the serialize step
+// and KCP would silently swallow the error (see T4.8). lo accepts any source
+// MAC anyway because nothing on the wire ever observes it: the loopback
+// driver hands the packet back up the stack, not out a physical link.
+var zeroMAC = net.HardwareAddr{0, 0, 0, 0, 0, 0}
 
 type TCPF struct {
 	tcpF       iterator.Iterator[conf.TCPF]
@@ -73,6 +85,19 @@ type SendHandle struct {
 	// mode; the syntfo transport installs a 32-bit-entropy deriver via this
 	// hook. nil keeps the legacy behaviour for transports that don't care.
 	synSeqDeriver SYNSeqDeriver
+
+	// writeSerializeErr counts gopacket.SerializeLayers failures inside
+	// Write. T4.8: before this counter existed, a SerializeLayers error on
+	// the SrcMAC length check was returned up through PacketConn.WriteTo
+	// and silently swallowed by KCP, making the failure mode "no packets
+	// on the wire" with no diagnostic. The counter ticks per failure; the
+	// warnLoggedSerialize flag throttles diagnostic logs to one line for
+	// the lifetime of the handle (per the per-packet log-spam ban in the
+	// design's Cross-Cutting Concerns).
+	writeSerializeErr   atomic.Uint64
+	writePcapErr        atomic.Uint64
+	warnLoggedSerialize atomic.Bool
+	warnLoggedPcap      atomic.Bool
 }
 
 func NewSendHandle(cfg *conf.Network) (*SendHandle, error) {
@@ -88,6 +113,19 @@ func NewSendHandle(cfg *conf.Network) (*SendHandle, error) {
 		}
 	}
 
+	// Normalise the source MAC. On the Linux loopback interface
+	// net.InterfaceByName("lo").HardwareAddr is nil/zero-length; without
+	// this every Ethernet.SerializeTo would fail with "invalid src MAC"
+	// (T4.8). zeroMAC is safe on lo because the loopback driver does not
+	// transmit the frame on any physical link — only the L3+ payload is
+	// re-delivered to the local stack. For non-loopback interfaces with
+	// a real hardware address we keep that address unchanged so packets
+	// emitted on physical NICs continue to carry the correct source MAC.
+	srcMAC := cfg.Interface.HardwareAddr
+	if len(srcMAC) != 6 {
+		srcMAC = zeroMAC
+	}
+
 	sh := &SendHandle{
 		handle:  handle,
 		srcPort: uint16(cfg.Port),
@@ -95,7 +133,7 @@ func NewSendHandle(cfg *conf.Network) (*SendHandle, error) {
 		time:    uint32(time.Now().UnixNano() / int64(time.Millisecond)),
 		ethPool: sync.Pool{
 			New: func() any {
-				return &layers.Ethernet{SrcMAC: cfg.Interface.HardwareAddr}
+				return &layers.Ethernet{SrcMAC: srcMAC}
 			},
 		},
 		ipv4Pool: sync.Pool{
@@ -259,9 +297,42 @@ func (h *SendHandle) Write(payload []byte, addr *net.UDPAddr) error {
 
 	opts := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
 	if err := gopacket.SerializeLayers(buf, opts, ethLayer, ipLayer, tcpLayer, gopacket.Payload(payload)); err != nil {
+		// T4.8: surface serialize failures via a counter + one-shot warn
+		// log. Without this, KCP swallows the error returned through
+		// PacketConn.WriteTo and the failure mode is "no packets on the
+		// wire" with zero diagnostic. The warn fires only on the first
+		// failure (CompareAndSwap on warnLoggedSerialize) so a steady-
+		// state bug does not spam the log per packet.
+		h.writeSerializeErr.Add(1)
+		if h.warnLoggedSerialize.CompareAndSwap(false, true) {
+			flog.Warnf("socket: gopacket SerializeLayers failed (further failures suppressed; see SendHandle counters): %v", err)
+		}
 		return err
 	}
-	return h.handle.WritePacketData(buf.Bytes())
+	if err := h.handle.WritePacketData(buf.Bytes()); err != nil {
+		// Mirror the diagnostic for pcap-level write errors. KCP will
+		// surface the failure as "no packets on the wire" otherwise.
+		h.writePcapErr.Add(1)
+		if h.warnLoggedPcap.CompareAndSwap(false, true) {
+			flog.Warnf("socket: pcap WritePacketData failed (further failures suppressed; see SendHandle counters): %v", err)
+		}
+		return err
+	}
+	return nil
+}
+
+// WriteSerializeErrCount returns the number of gopacket.SerializeLayers
+// failures observed by this handle. Exposed for tests and a future metrics
+// scraper; the counter is incremented in-place by Write on every failed
+// serialize.
+func (h *SendHandle) WriteSerializeErrCount() uint64 {
+	return h.writeSerializeErr.Load()
+}
+
+// WritePcapErrCount returns the number of pcap WritePacketData failures
+// observed by this handle. Same rationale as WriteSerializeErrCount.
+func (h *SendHandle) WritePcapErrCount() uint64 {
+	return h.writePcapErr.Load()
 }
 
 func (h *SendHandle) getClientTCPF(dstIP net.IP, dstPort uint16) conf.TCPF {
