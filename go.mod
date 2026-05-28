@@ -8,7 +8,7 @@ require (
 	github.com/spf13/cobra v1.10.2
 	github.com/txthinking/socks5 v0.0.0-20251011041537-5c31f201a10e
 	github.com/xtaci/kcp-go/v5 v5.6.64
-	github.com/xtaci/smux v1.5.53
+	github.com/xtaci/smux v1.5.57
 	go.uber.org/goleak v1.3.0
 	golang.org/x/crypto v0.50.0
 	golang.org/x/net v0.52.0
